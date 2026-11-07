@@ -1,3 +1,720 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..7e73d5f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_sd.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
+new file mode 100644
+index 0000000..5ffe735
+--- /dev/null
++++ b/bsd/dev/sweet_sd.c
+@@ -0,0 +1,699 @@
++/*
++ * SWEET (Raspberry Pi 5) SD card root device.
++ *
++ * The BCM2712 SD host (brcm,bcm2712-sdhci, a standard SDHCI 3.0 controller at
++ * the ADT /sweet-sd node: reg = <host size cfg size>, absolute physical) is
++ * the one the Pi firmware loaded this kernel through. This driver
++ * re-initialises the card from CMD0 at 400 kHz, brings it to 4-bit 25 MHz
++ * default speed and moves data with polled PIO through the buffer data port
++ * (no DMA, no interrupts), one command at a time.
++ *
++ * Signalling voltage is left as the firmware set it: a card the firmware
++ * switched to 1.8 V stays at 1.8 V until power-cycled (CMD0 does not undo
++ * it), so the host's 1.8 V enable is kept; only the UHS timing mode is reset
++ * to SDR12, which default-speed operation at 25 MHz uses at either voltage.
++ *
++ * It finds one MBR partition (boot-arg sdpart=1..4, else the first of type
++ * 0xAF, HFS+) and exposes it as the BSD disk sdroot0 (rsdroot0). Root on it
++ * with rd=sdroot0. Writes are refused unless boot-arg sdrw=1, and every write
++ * is checked against the partition bounds right before it is issued.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* SDHCI registers, all accessed as aligned 32-bit words. */
++#define SD_BLK          0x04    /* [11:0] block size, [31:16] block count */
++#define SD_ARG          0x08
++#define SD_XFER         0x0c    /* [15:0] transfer mode, [31:16] command */
++#define SD_RESP0        0x10
++#define SD_DATA         0x20
++#define SD_PRESENT      0x24
++#define SD_HOSTCTL      0x28    /* [7:0] host control 1, [15:8] power control */
++#define SD_CLKCTL       0x2c    /* [15:0] clock, [19:16] timeout, [26:24] reset */
++#define SD_INT          0x30    /* [15:0] normal status, [31:16] error status */
++#define SD_INT_EN       0x34
++#define SD_SIG_EN       0x38
++#define SD_CTRL2        0x3c    /* [31:16] host control 2 */
++#define SD_CAPS         0x40
++#define SD_VERSION      0xfc    /* [31:16] host controller version */
++
++#define CFG_CTRL        0x00    /* brcmstb SDIO_CFG_CTRL */
++#define CFG_CD_TEST_EN  (1u << 31)
++#define CFG_CD_TEST_LEV (1u << 30)
++
++#define PRES_CMD_INH    (1u << 0)
++#define PRES_DAT_INH    (1u << 1)
++#define PRES_CARD       (1u << 16)
++#define PRES_DAT0       (1u << 20)
++
++#define INT_CMD_DONE    (1u << 0)
++#define INT_XFER_DONE   (1u << 1)
++#define INT_BUF_WR      (1u << 4)
++#define INT_BUF_RD      (1u << 5)
++#define INT_ERR         (1u << 15)
++
++#define CLK_INT_EN      (1u << 0)
++#define CLK_INT_STABLE  (1u << 1)
++#define CLK_CARD_EN     (1u << 2)
++#define RST_ALL         (1u << 24)
++#define RST_CMD         (1u << 25)
++#define RST_DAT         (1u << 26)
++
++#define HC1_4BIT        (1u << 1)
++#define HC2_1V8         (1u << (16 + 3))
++
++/* Command register flags: response type, CRC/index checks, data present. */
++#define R_NONE          0x00
++#define R_R2            0x09
++#define R_R3            0x02
++#define R_R1            0x1a    /* also R6, R7 */
++#define R_R1B           0x1b
++#define F_DATA          0x20
++
++/* Transfer mode */
++#define TM_BLKCNT       (1u << 1)
++#define TM_ACMD12       (1u << 2)
++#define TM_READ         (1u << 4)
++#define TM_MULTI        (1u << 5)
++
++#define SD_BLOCK        512u
++#define SD_MAX_BLOCKS   2048u                   /* per command: 1 MiB */
++#define SD_TIMEOUT_NS   (2ull * NSEC_PER_SEC)
++
++static struct {
++	vm_offset_t regs, cfg;
++	uint32_t base_hz;
++	uint32_t rca;
++	bool ccs;                               /* block (not byte) addressed */
++	uint64_t card_blocks;                   /* from the CSD, 0 if unknown */
++	uint64_t first_block, nblocks;          /* partition, in 512-byte blocks */
++	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool writable;                          /* boot-arg sdrw=1 */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} sd;
++
++static LCK_GRP_DECLARE(sweet_sd_grp, "sweet_sd");
++static LCK_MTX_DECLARE(sweet_sd_lock, &sweet_sd_grp);
++
++static inline uint32_t
++sd_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sd.regs + off);
++}
++
++static inline void
++sd_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(sd.regs + off) = v;
++}
++
++static uint64_t
++sd_deadline(void)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(SD_TIMEOUT_NS, &t);
++	return mach_absolute_time() + t;
++}
++
++/* Wait until (reg & mask) == want. */
++static int
++sd_wait(uint32_t off, uint32_t mask, uint32_t want)
++{
++	uint64_t deadline = sd_deadline();
++	while ((sd_rd(off) & mask) != want) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++static void
++sd_reset(uint32_t bits)
++{
++	sd_wr(SD_CLKCTL, sd_rd(SD_CLKCTL) | bits);
++	if (sd_wait(SD_CLKCTL, bits, 0)) {
++		printf("SWEET SD: reset 0x%x did not complete\n", bits);
++	}
++}
++
++/* Wait for any of the status bits in want (or an error), then ack them. */
++static int
++sd_wait_int(uint32_t want, const char *what, uint32_t cmd)
++{
++	uint64_t deadline = sd_deadline();
++	uint32_t st;
++	while (!((st = sd_rd(SD_INT)) & (want | INT_ERR))) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET SD: CMD%u %s timed out (status 0x%x present 0x%x)\n",
++			    cmd, what, st, sd_rd(SD_PRESENT));
++			sd_reset(RST_CMD | RST_DAT);
++			return ETIMEDOUT;
++		}
++	}
++	if (st & INT_ERR) {
++		printf("SWEET SD: CMD%u %s error 0x%04x (present 0x%x)\n",
++		    cmd, what, st >> 16, sd_rd(SD_PRESENT));
++		sd_wr(SD_INT, st);
++		sd_reset(RST_CMD | RST_DAT);
++		return EIO;
++	}
++	sd_wr(SD_INT, st & want);
++	return 0;
++}
++
++/*
++ * Issue one command. For data commands the caller then moves the blocks
++ * through SD_DATA. resp (4 words, may be NULL) receives the response.
++ */
++static int
++sd_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t mode, uint32_t blocks,
++    uint32_t resp[4])
++{
++	uint32_t inhibit = PRES_CMD_INH | ((flags & F_DATA) || flags == R_R1B ? PRES_DAT_INH : 0);
++	if (sd_wait(SD_PRESENT, inhibit, 0)) {
++		printf("SWEET SD: CMD%u: line busy (present 0x%x)\n", idx, sd_rd(SD_PRESENT));
++		sd_reset(RST_CMD | RST_DAT);
++		return ETIMEDOUT;
++	}
++	sd_wr(SD_INT, 0xffffffff);
++	if (flags & F_DATA) {
++		sd_wr(SD_BLK, SD_BLOCK | (blocks << 16));
++	}
++	sd_wr(SD_ARG, arg);
++	sd_wr(SD_XFER, mode | ((idx << 8 | flags) << 16));
++	int error = sd_wait_int(INT_CMD_DONE, "command", idx);
++	if (error) {
++		return error;
++	}
++	if (resp) {
++		for (int i = 0; i < 4; i++) {
++			resp[i] = sd_rd(SD_RESP0 + 4 * i);
++		}
++	}
++	if (flags == R_R1B) {
++		error = sd_wait_int(INT_XFER_DONE, "busy", idx);
++	}
++	return error;
++}
++
++static int
++sd_acmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t resp[4])
++{
++	int error = sd_cmd(55, sd.rca << 16, R_R1, 0, 0, NULL);
++	return error ? error : sd_cmd(idx, arg, flags, 0, 0, resp);
++}
++
++static int
++sd_set_clock(uint32_t hz)
++{
++	uint32_t c = sd_rd(SD_CLKCTL) & ~0x000fffffu;
++	sd_wr(SD_CLKCTL, c);                    /* stop the clock */
++	uint32_t div = 0;
++	if (sd.base_hz > hz) {
++		div = (sd.base_hz + 2 * hz - 1) / (2 * hz);
++		div = MIN(div, 1023u);
++	}
++	c |= (div & 0xff) << 8 | ((div >> 8) & 3) << 6 | 0xeu << 16 | CLK_INT_EN;
++	sd_wr(SD_CLKCTL, c);
++	if (sd_wait(SD_CLKCTL, CLK_INT_STABLE, CLK_INT_STABLE)) {
++		printf("SWEET SD: clock did not stabilise\n");
++		return ETIMEDOUT;
++	}
++	sd_wr(SD_CLKCTL, sd_rd(SD_CLKCTL) | CLK_CARD_EN);
++	delay(2000);
++	printf("SWEET SD: card clock %u kHz (divider %u)\n",
++	    div ? sd.base_hz / (2 * div) / 1000 : sd.base_hz / 1000, div);
++	return 0;
++}
++
++/* PIO: n blocks (n >= 1) between the card and buf, which may be unaligned. */
++static int
++sd_xfer(uint64_t lba, uint32_t n, uint8_t *buf, bool write)
++{
++	uint32_t addr = (uint32_t)(sd.ccs ? lba : lba * SD_BLOCK);
++	uint32_t mode = (write ? 0 : TM_READ) | (n > 1 ? TM_MULTI | TM_BLKCNT | TM_ACMD12 : 0);
++	uint32_t idx = write ? (n > 1 ? 25 : 24) : (n > 1 ? 18 : 17);
++
++	if ((!sd.ccs && lba * SD_BLOCK > UINT32_MAX) || lba > UINT32_MAX) {
++		return EINVAL;
++	}
++	int error = sd_cmd(idx, addr, R_R1 | F_DATA, mode, n, NULL);
++	if (error) {
++		return error;
++	}
++	for (uint32_t b = 0; b < n; b++) {
++		error = sd_wait_int(write ? INT_BUF_WR : INT_BUF_RD, "data", idx);
++		if (error) {
++			return error;
++		}
++		uint8_t *p = buf + (size_t)b * SD_BLOCK;
++		for (uint32_t i = 0; i < SD_BLOCK; i += 4) {
++			uint32_t w;
++			if (write) {
++				memcpy(&w, p + i, 4);
++				sd_wr(SD_DATA, w);
++			} else {
++				w = sd_rd(SD_DATA);
++				memcpy(p + i, &w, 4);
++			}
++		}
++	}
++	/* For writes this also covers the card's programming busy. */
++	return sd_wait_int(INT_XFER_DONE, "transfer", idx);
++}
++
++static int
++sd_read(uint64_t lba, uint32_t n, uint8_t *buf)
++{
++	return sd_xfer(lba, n, buf, false);
++}
++
++/* The only place data goes to the card: inside the partition, or nothing. */
++static int
++sd_write(uint64_t lba, uint32_t n, uint8_t *buf)
++{
++	if (!sd.writable || !sd.nblocks || n == 0 || lba < sd.first_block ||
++	    lba - sd.first_block >= sd.nblocks || n > sd.nblocks - (lba - sd.first_block)) {
++		printf("SWEET SD: refusing write of %u blocks at 0x%llx\n", n, lba);
++		return EPERM;
++	}
++	return sd_xfer(lba, n, buf, true);
++}
++
++static int
++sd_card_init(void)
++{
++	uint32_t r[4];
++	int error;
++
++	uint32_t present = sd_rd(SD_PRESENT), caps = sd_rd(SD_CAPS);
++	printf("SWEET SD: SDHCI version 0x%x caps 0x%x present 0x%x hostctl 0x%x clk 0x%x ctrl2 0x%x cfg 0x%x\n",
++	    sd_rd(SD_VERSION) >> 16, caps, present, sd_rd(SD_HOSTCTL), sd_rd(SD_CLKCTL),
++	    sd_rd(SD_CTRL2) >> 16, sd.cfg ? *(volatile uint32_t *)(sd.cfg + CFG_CTRL) : 0);
++	sd.base_hz = ((caps >> 8) & 0xff) * 1000000u;
++	if (!sd.base_hz) {
++		sd.base_hz = 200000000u;        /* the Pi 5 emmc2 clock */
++	}
++	PE_parse_boot_argn("sdbase", &sd.base_hz, sizeof(sd.base_hz));
++
++	/*
++	 * The Pi 5 card-detect pin is a GPIO, not the host's: force "inserted",
++	 * first through the brcmstb config block, then the SDHCI test bits.
++	 */
++	if (!(present & PRES_CARD) && sd.cfg) {
++		volatile uint32_t *cfg = (volatile uint32_t *)(sd.cfg + CFG_CTRL);
++		*cfg |= CFG_CD_TEST_EN | CFG_CD_TEST_LEV;
++		delay(1000);
++		present = sd_rd(SD_PRESENT);
++	}
++	if (!(present & PRES_CARD)) {
++		sd_wr(SD_HOSTCTL, sd_rd(SD_HOSTCTL) | (3u << 6));
++		delay(1000);
++		present = sd_rd(SD_PRESENT);
++	}
++	printf("SWEET SD: present 0x%x (card %s)\n", present, present & PRES_CARD ? "detected" : "NOT detected");
++
++	sd_reset(RST_CMD | RST_DAT);
++	uint32_t hc = sd_rd(SD_HOSTCTL);
++	if (!(hc & (1u << 8))) {
++		hc = (hc & ~0xff00u) | (0x0fu << 8);    /* 3.3 V, bus power on */
++		sd_wr(SD_HOSTCTL, hc);
++		delay(20000);
++	}
++	sd_wr(SD_HOSTCTL, hc & ~0x3eu);         /* 1-bit, normal speed, no DMA */
++	uint32_t c2 = sd_rd(SD_CTRL2);
++	bool v18 = (c2 & HC2_1V8) != 0;
++	/* UHS mode SDR12, no tuning, no preset values; keep the signalling voltage. */
++	sd_wr(SD_CTRL2, c2 & ~((7u << 16) | (3u << 22) | (1u << 31)));
++	sd_wr(SD_INT_EN, 0xffff00ffu);
++	sd_wr(SD_SIG_EN, 0);
++	sd_wr(SD_INT, 0xffffffff);
++
++	if ((error = sd_set_clock(400000))) {
++		return error;
++	}
++
++	sd.rca = 0;
++	sd_cmd(0, 0, R_NONE, 0, 0, NULL);       /* GO_IDLE_STATE */
++	delay(2000);
++	bool v2 = sd_cmd(8, 0x1aa, R_R1, 0, 0, r) == 0 && (r[0] & 0xfff) == 0x1aa;
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &deadline);
++	deadline += mach_absolute_time();
++	do {
++		error = sd_acmd(41, (v2 ? 1u << 30 : 0) | 0x00ff8000u, R_R3, r);
++		if (error) {
++			return error;
++		}
++		if (r[0] & (1u << 31)) {
++			break;
++		}
++		delay(10000);
++	} while (mach_absolute_time() < deadline);
++	if (!(r[0] & (1u << 31))) {
++		printf("SWEET SD: card never left power-up (OCR 0x%x)\n", r[0]);
++		return ETIMEDOUT;
++	}
++	sd.ccs = (r[0] >> 30) & 1;
++	printf("SWEET SD: OCR 0x%08x (%s, %s signalling)\n", r[0],
++	    sd.ccs ? "SDHC/SDXC" : "SDSC", v18 ? "1.8 V" : "3.3 V");
++
++	if ((error = sd_cmd(2, 0, R_R2, 0, 0, r))) {          /* ALL_SEND_CID */
++		return error;
++	}
++	/* CID bits [127:8] are in RESP[119:0]: product name [103:64] at RESP[95:56]. */
++	char pnm[6] = {
++		(char)(r[2] >> 24), (char)(r[2] >> 16), (char)(r[2] >> 8),
++		(char)(r[2] >> 0), (char)(r[1] >> 24), 0
++	};
++	for (int i = 0; i < 5; i++) {
++		if (pnm[i] < 0x20 || pnm[i] > 0x7e) {
++			pnm[i] = '?';
++		}
++	}
++	if ((error = sd_cmd(3, 0, R_R1, 0, 0, r))) {          /* SEND_RELATIVE_ADDR */
++		return error;
++	}
++	sd.rca = r[0] >> 16;
++	if ((error = sd_cmd(9, sd.rca << 16, R_R2, 0, 0, r))) { /* SEND_CSD */
++		return error;
++	}
++	if (((r[3] >> 22) & 3) == 1) {          /* CSD version 2: C_SIZE in [69:48] */
++		sd.card_blocks = ((uint64_t)((r[1] >> 8) & 0x3fffff) + 1) * 1024;
++	}
++	printf("SWEET SD: card \"%s\" rca 0x%x, %llu MiB\n", pnm, sd.rca, sd.card_blocks >> 11);
++	if ((error = sd_cmd(7, sd.rca << 16, R_R1B, 0, 0, NULL))) {     /* SELECT_CARD */
++		return error;
++	}
++	if ((error = sd_acmd(6, 2, R_R1, NULL))) {               /* 4-bit bus */
++		return error;
++	}
++	sd_wr(SD_HOSTCTL, sd_rd(SD_HOSTCTL) | HC1_4BIT);
++	if ((error = sd_cmd(16, SD_BLOCK, R_R1, 0, 0, NULL))) {
++		return error;
++	}
++	uint32_t hz = 25000000;
++	PE_parse_boot_argn("sdclk", &hz, sizeof(hz));
++	return sd_set_clock(MIN(hz, 25000000u));
++}
++
++static int
++sd_find_partition(void)
++{
++	static uint8_t b[SD_BLOCK];
++	int error = sd_read(0, 1, b);
++	if (error) {
++		return error;
++	}
++	if (b[510] != 0x55 || b[511] != 0xaa) {
++		printf("SWEET SD: no MBR on the card\n");
++		return ENXIO;
++	}
++	uint32_t want = 0;
++	PE_parse_boot_argn("sdpart", &want, sizeof(want));
++	int pick = -1;
++	for (int i = 0; i < 4; i++) {
++		const uint8_t *e = b + 446 + 16 * i;
++		uint32_t start, count;
++		memcpy(&start, e + 8, 4);
++		memcpy(&count, e + 12, 4);
++		printf("SWEET SD: MBR partition %d: type 0x%02x, start %u, %u MiB\n",
++		    i + 1, e[4], start, count >> 11);
++		if (pick < 0 && count && (want ? (uint32_t)i + 1 == want : e[4] == 0xaf)) {
++			pick = i;
++			sd.first_block = start;
++			sd.nblocks = count;
++		}
++	}
++	if (pick < 0) {
++		printf("SWEET SD: no %s partition\n", want ? "sdpart=" : "type 0xAF (HFS+)");
++		return ENOENT;
++	}
++	if (sd.card_blocks && sd.first_block + sd.nblocks > sd.card_blocks) {
++		printf("SWEET SD: partition %d runs past the end of the card\n", pick + 1);
++		return ENXIO;
++	}
++	/* HFS+ volume header at byte 1024: signature "H+" or "HX". */
++	if ((error = sd_read(sd.first_block + 2, 1, b))) {
++		return error;
++	}
++	printf("SWEET SD: partition %d volume signature %c%c\n", pick + 1,
++	    b[0] >= 0x20 && b[0] < 0x7f ? b[0] : '?', b[1] >= 0x20 && b[1] < 0x7f ? b[1] : '?');
++	return 0;
++}
++
++static int
++sweet_sd_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!sd.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !sd.writable) ? EROFS : 0;
++}
++
++static int
++sweet_sd_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_sd_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * sd.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = sd.nblocks * SD_BLOCK;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !sd.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off || (off | count) % SD_BLOCK) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++	lck_mtx_lock(&sweet_sd_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint32_t n = MIN((count - done) / SD_BLOCK, SD_MAX_BLOCKS);
++		uint64_t lba = sd.first_block + (off + done) / SD_BLOCK;
++		error = rd ? sd_read(lba, n, (uint8_t *)vaddr + done) :
++		    sd_write(lba, n, (uint8_t *)vaddr + done);
++		if (error) {
++			break;
++		}
++		done += n * SD_BLOCK;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_sd_lock);
++	buf_unmap(bp);
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_sd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = sd.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		sd.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = SD_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = sd.nblocks * SD_BLOCK / sd.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = sd.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;                       /* every write completes on the card */
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = SD_MAX_BLOCKS * SD_BLOCK / sd.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = sd.writable ? SD_MAX_BLOCKS * SD_BLOCK / sd.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_sd_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_sd_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_sd_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_sd_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++sweet_sd_psize(__unused dev_t dev)
++{
++	return sd.ready ? (int)MIN(sd.nblocks * SD_BLOCK / sd.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_sd_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_sd_strategy, NULL, dev, B_READ, minphys, uio, (int)sd.secsize);
++}
++
++static int
++sweet_sd_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!sd.writable) {
++		return EROFS;
++	}
++	return physio(sweet_sd_strategy, NULL, dev, B_WRITE, minphys, uio, (int)sd.secsize);
++}
++
++static const struct bdevsw sweet_sd_bdevsw = {
++	.d_open     = sweet_sd_open,
++	.d_close    = sweet_sd_close,
++	.d_strategy = sweet_sd_strategy,
++	.d_ioctl    = sweet_sd_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_sd_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_sd_cdevsw = {
++	.d_open       = sweet_sd_open,
++	.d_close      = sweet_sd_close,
++	.d_read       = sweet_sd_read,
++	.d_write      = sweet_sd_write,
++	.d_ioctl      = sweet_sd_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++sweet_sd_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-sd", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET SD: no /sweet-sd node in the device tree\n");
++		return ENXIO;
++	}
++	sd.regs = ml_io_map(reg[0], reg[1]);
++	if (size >= 4 * sizeof(uintptr_t)) {
++		sd.cfg = ml_io_map(reg[2], reg[3]);
++	}
++	uint32_t rw = 0;
++	PE_parse_boot_argn("sdrw", &rw, sizeof(rw));
++	sd.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_sd_lock);
++	int error = sd_card_init();
++	if (!error) {
++		error = sd_find_partition();
++	}
++	lck_mtx_unlock(&sweet_sd_lock);
++	if (error) {
++		return error;
++	}
++
++	sd.bmajor = bdevsw_add(-1, &sweet_sd_bdevsw);
++	if (sd.bmajor < 0) {
++		return ENXIO;
++	}
++	sd.cmajor = cdevsw_add_with_bdev(-1, &sweet_sd_cdevsw, sd.bmajor);
++	if (sd.cmajor < 0) {
++		return ENXIO;
++	}
++	sd.bdev = makedev(sd.bmajor, 0);
++	devfs_make_node(sd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "sdroot0");
++	devfs_make_node(makedev(sd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rsdroot0");
++	/* Only now, with the partition bounds known, can writes be allowed. */
++	sd.writable = (rw != 0);
++	sd.ready = true;
++	printf("SWEET SD: root partition at block %llu, %llu MiB, %s\n",
++	    sd.first_block, sd.nblocks >> 11, sd.writable ? "read-write" : "read-only");
++	return 0;
++}
++
++/* Root device for rd=sdroot0 (IOFindBSDRoot). */
++int sweet_sd_rootdev(dev_t *dev);
++
++int
++sweet_sd_rootdev(dev_t *dev)
++{
++	if (!sd.ready) {
++		int error = sweet_sd_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = sd.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 index 2545cf9..f16af1b 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
@@ -131,6 +848,33 @@ index 92f3e26..dd26cb2 100644
      "     'IOProbeScore'    = 10000:32;"
      "   },"
      "   {"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..0c082c7 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,22 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++//
++//	SWEET (Pi 5): root on an MBR partition of the SD card (bsd/dev/sweet_sd.c)
++//
++	if (strcmp(rdBootVar, "sdroot0") == 0) {
++		extern int sweet_sd_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int sd_error = sweet_sd_rootdev(root);
++		if (sd_error) {
++			panic("IOFindBSDRoot: SWEET SD root %s unavailable: %d", rdBootVar, sd_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d
++", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
 index 42362c5..895c357 100644
 --- a/osfmk/arm/arm_init.c

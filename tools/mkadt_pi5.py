@@ -156,6 +156,15 @@ def build(qemu=False, seed=None):
             ('stride', u32(stride)),
         ]))
 
+    # bsd/dev/sweet_sd.c: the SD host the firmware booted from (rd=sdroot0).
+    # reg = <SDHCI size brcmstb-cfg size>, absolute physical; QEMU virt has none.
+    if not qemu:
+        extra.append(node('sweet-sd', [
+            ph(),
+            ('compatible', cstr('brcm,bcm2712-sdhci')),
+            ('reg', u64(0x107cfff000, 0x100, 0x107cfff400, 0x100)),
+        ]))
+
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
     # iPad (6th generation) has a Home button: home-button-type 0.
     buttons = node('buttons', [
