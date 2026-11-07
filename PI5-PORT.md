@@ -192,6 +192,21 @@ Pi payload (cf66a8a, cmdline `debug=0xc serial=3 cpus=4 keepsyms=1
 -noprogress -v interrupt-masked-debug-mode=1`): out-pi5/payload.bin,
 16607168 bytes, sha256 be5e82db...
 
+**Third real-Pi boot (cf66a8a, 2026-11-07, user report): far past stage 8.**
+- cpus=4: "4/4 CPUs" seen, battery 100% (SweetBattery stand-in), then the
+  last line stays `ifnet_attach: All kernel threads created for interface
+  lo0 have been scheduled at least once. Proceeding.` No gif0 "Waiting for
+  all kernel threads" line, so it hangs between lo0's attach and gif0's.
+- **cpus=1 (out-pi5/payload-cpus1.bin, sha256 e23a4677...): passes stf0 and
+  stops at `Waiting on <dict> IOProviderClass IOMedia, Content Apple_HFS`,
+  then "Failed to write boot-picker-bringup-reason to NVRAM" (no Apple
+  NVRAM; harmless, also in QEMU). STAGE 2 REACHED ON REAL HARDWARE (1 CPU).**
+- So the 4-CPU hang is SMP-only on the real GIC-400. Suspect: cross-CPU
+  SGIs (only self-SGIs were checked on hardware; QEMU's GIC has no security
+  extensions). Commit b2646a6 adds a `SWEET IPI: cpu A -> cpu B: OK|LOST`
+  test after "4/4" and per-CPU IGROUPR0/GICC_CTLR/GICD_CTLR in the "SWEET
+  GIC: cpu N" lines. Run 42398055028 building.
+
 Next: `gh workflow run xnu.yml -R techmaster2013/ios-sweet --ref pi5-port -f board=pi5`, then
 `mkpayload.py KERNEL out-pi5/pi5-qemu.adt payload.bin --cmdline "debug=0x8 serial=3 cpus=1 -v"`
 and `shim-pi5/qemu.sh 60 payload.bin`.
