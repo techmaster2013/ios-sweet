@@ -346,3 +346,18 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   gcc-13 + gcc-13-plugin-dev; a GCC 15 build is rejected ("disagrees about
   version of symbol module_layout"). Reload with `wsl-hfsplus.sh load` after
   each WSL restart. Verified: mkfs.hfsplus + loop mount + write + read back.
+- **iPadOS root image built (2026-11-07):** ~/pi5-build/ipados-16.6.1-20G81-root.img
+  in WSL (16 GiB sparse, not in git), `mkiosroot.sh` from the j71bap OS +
+  SystemOS + AppOS images, ~3.5 min. HFSX ('HX' v5), journaled, cleanly
+  unmounted, not inconsistent, 174262 files / 111889 folders, 10.9 GiB used.
+  Checked read-only: launchd, dyld, SpringBoard, backboardd, shared cache
+  hard-linked into /System/Library/Caches/com.apple.dyld, log stores 272:272,
+  systembag.kb 0:0 0600, 478 LaunchDaemons. libSystem.B.dylib exists only in
+  the shared cache (normal for iOS 16).
+  - mkiosroot.sh fix: Ubuntu 26.04's uutils `install` rejects owners with no
+    host passwd entry ("install: invalid user: '272'"); owners now set with
+    chown (numeric IDs work everywhere).
+  - `fsck.hfsplus -n` after the `-y` pass still says "Volume header needs
+    minor repair (1, 0)" / "invalid primary VHB ... result 35" (VIStat
+    0x8000 only, all B-tree/catalog checks clean) while `-y` says OK: a
+    read-only-mode quirk of the Linux fsck port, header flags are fine.
