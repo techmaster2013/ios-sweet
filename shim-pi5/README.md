@@ -45,3 +45,32 @@ stage 2 board config and ADT.
 If HDMI stays black but the UART works, comment out `dtoverlay=vc4-kms-v3d`
 in `config.txt`. If the UART is silent too, the screen may still show a red
 or blue panic page with the exception registers.
+
+# Stage 2: boot xnu
+
+With a payload in the initramfs the same shim skips the GIC/SMP tests and
+boots xnu instead (`loader.c`). Kernel: CI artifact of
+`gh workflow run xnu.yml --ref pi5-port -f board=pi5`.
+
+```bash
+python3 tools/mkadt_pi5.py out-pi5/pi5.adt
+```
+
+```bash
+python3 tools/mkpayload.py xnu/out-pi5-XXXX/kernel.development.sweet out-pi5/pi5.adt out-pi5/payload.bin --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam -noprogress -v interrupt-masked-debug-mode=1"
+```
+
+On the SD card: copy `out-pi5/payload.bin` next to the shim and add one line
+to the stage 1 block in `config.txt`:
+
+```
+initramfs payload.bin followkernel
+```
+
+Expected on the UART and HDMI: the shim's checks, "SWEETXNU payload found",
+then xnu's own log ("SWEET GIC: GICv2 GICD 0x107fff9000 ...", the Darwin
+banner, "SWEET CPU: ... SGI1 OK") until it waits for a root device
+(`Waiting on ... IOMedia ... Apple_HFS`): stage 3 adds the root.
+
+QEMU: `mkadt_pi5.py --qemu` (QEMU GIC/UART addresses, kernel RAM at 4 GB,
+QEMU MPIDRs), then `shim-pi5/qemu.sh 60 PATH/TO/payload.bin`.

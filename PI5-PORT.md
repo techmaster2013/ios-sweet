@@ -107,7 +107,38 @@ write), FAR 0x3fbad000 = the early-console marker band at
 in 0101): on Pi 5, start.s stage 0 and the sweet_early_* console run only if
 boot_args->Video.v_baseAddr == SWEET_EARLY_FB_PA (the shim reports 0 in
 QEMU). Also protects a real Pi whose HDMI mode moves the framebuffer.
-Run 42377501437 (c886dcd) building.
+
+**Run 42377501437 (c886dcd), QEMU cpus=1: XNU boots to the root-device
+wait** (out-pi5/qemu-c886dcd-cpus1.log): "SWEET GIC: GICv2 GICD 0x8000000
+GICC 0x8010000, virtual timer INTID 27", "cpu 0 interface mask 0x1",
+Darwin Kernel Version 22.6.0 (xnu-8796.141.3), SweetCPU "SGI1 OK" (self-IPI
+through GICD_SGIR + GICC ack/EOI), timer and scheduler running (Skywalk self
+tests, ifnet threads), ends at `Waiting on <dict> IOProviderClass IOMedia,
+Content Apple_HFS` = no root yet (stage 3).
+cpus=4 failed twice, both QEMU-layout issues: PSCI CPU_ON rc=-2 for
+target 0x100 (QEMU virt MPIDRs are 0x1-0x3), then SweetCPU's phone topology
+check rejected mpidr 0x1. Fixed in 23d34a5 (mkadt_pi5 --qemu uses Aff0;
+SweetCPU accepts 0x000-0x300 or 0x0-0x3 on Pi 5).
+
+**Run 42378624537 (23d34a5), QEMU cpus=4: STAGE 2 PASSES IN QEMU**
+(out-pi5/qemu-23d34a5-cpus4.log). All four CPUs: PSCI CPU_ON rc=0, enter at
+EL2, drop to EL1, GIC interface masks 0x1/0x2/0x4/0x8, "SGI1 OK" each,
+"4/4 CPUs initialized, SGI1 verified"; boot continues to the root-device wait.
+The first cpus=4 run panicked "Interrupts held disabled for 21733680 ns
+(timeout 13631488 ns)": the SCHED_HYGIENE interrupt-masked timeout is
+0xd0000 timebase ticks, sized for Apple's 24 MHz timebase (35.5 ms); at
+QEMU's 62.5 MHz it is 13.6 ms, at the Pi's 54 MHz 15.8 ms, and TCG emulation
+of 4 CPUs is slow. Bring-up boot-args now include
+`interrupt-masked-debug-mode=1` (TRACE: recorded in ktrace, not on the
+console, so the serial log shows nothing either way). Revisit on hardware:
+a ml-timeout-interrupt-masked override scaled to 54 MHz would keep PANIC mode.
+
+Real-Pi payload ready: out-pi5/payload.bin (16590368 bytes, sha256 85c67008...,
+kernel 23d34a5 + `mkadt_pi5.py` Pi ADT, cmdline `debug=0xc serial=3 cpus=4
+keepsyms=1 -enable_kprintf_spam -noprogress -v interrupt-masked-debug-mode=1`).
+Needs `initramfs payload.bin followkernel` in config.txt (shim-pi5/README.md).
+The current SD card cannot create new files (FAT damage, see chat
+2026-11-07): reuse an existing file or re-flash.
 
 Next: `gh workflow run xnu.yml -R techmaster2013/ios-sweet --ref pi5-port -f board=pi5`, then
 `mkpayload.py KERNEL out-pi5/pi5-qemu.adt payload.bin --cmdline "debug=0x8 serial=3 cpus=1 -v"`
