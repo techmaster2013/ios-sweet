@@ -87,10 +87,10 @@ index 42362c5..895c357 100644
  
  	arm_setup_pre_sign();
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 06bb568..2bd5597 100644
+index 06bb568..018eaab 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1837,13 +1837,22 @@ static void
+@@ -1837,18 +1837,68 @@ static void
  sweet_early_map_final(void)
  {
  	const vm_map_address_t va = SWEET_EARLY_FB_VA;
@@ -108,13 +108,60 @@ index 06bb568..2bd5597 100644
  	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
  	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
  	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
- 	assert(*slot == ARM_TTE_EMPTY);
+-	assert(*slot == ARM_TTE_EMPTY);
 -	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
-+	*slot = block_pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	const tt_entry_t want = block_pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
  	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
  	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
  	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
-@@ -2190,7 +2199,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
++#if SWEET_BOARD_PI5
++	/* Called twice on Pi 5 (see sweet_early_map_retry): may already be ours. */
++	assert(*slot == ARM_TTE_EMPTY || *slot == want);
++#else
++	assert(*slot == ARM_TTE_EMPTY);
++#endif
++	*slot = want;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
++
++#if SWEET_BOARD_PI5
++/*
++ * Real Pi 5 (8ffdc02): after the TTBR1 switch, AT S1E1W on the framebuffer
++ * VA gave a level 2 translation fault although sweet_early_map_final wrote
++ * the block entry (QEMU translates). The early console paused at stage 8c.
++ * Now cpu_tte points at the final tables through the final physmap: write
++ * the entry again, make it visible to the table walker, flush the TLB and
++ * let the console re-check. Reports what the slot held before the rewrite.
++ */
++static void
++sweet_early_map_retry(void)
++{
++	if (!sweet_early_suspended()) {
++		return;
++	}
++	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	if ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
++		sweet_early_resume(l1, 0, 0);   /* AT will fault: console off */
++		return;
++	}
++	tt_entry_t *slot = &((tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK))[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++	tt_entry_t before = *slot;
++	if (before != ARM_TTE_EMPTY && (before & ARM_TTE_TYPE_MASK) != ARM_TTE_TYPE_BLOCK) {
++		sweet_early_resume(l1, before, before);  /* something else lives here: leave it */
++		return;
++	}
++	sweet_early_map_final();
++	__asm__ volatile("dsb ish" ::: "memory");
++	flush_mmu_tlb();
++	__builtin_arm_isb(ISB_SY);
++	sweet_early_resume(l1, before, *slot);
++}
++#endif
+ #endif
+ 
+ void
+@@ -2190,7 +2240,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  
  #if defined(SWEET)
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
@@ -126,6 +173,16 @@ index 06bb568..2bd5597 100644
 +#endif
  #endif
  	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+@@ -2201,6 +2255,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
+ 	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
+ 	sweet_early_mark(11, "physmap table pointers rebound");
++#if SWEET_BOARD_PI5
++	sweet_early_map_retry();
++#endif
+ 
+ 	// From here on out, we're off the bootstrap translation tables.
  
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 index 24f1abc..ec9b26d 100644
@@ -253,14 +310,15 @@ index 023086f..54e5b63 100644
  
  	/* Ensure TTEs are visible */
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
-index 6928957..c0458d6 100644
+index 6928957..343dcf3 100644
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
-@@ -10,12 +10,24 @@
+@@ -10,12 +10,25 @@
  #if defined(SWEET)
  #include <stdint.h>
  #include <kern/misc_protos.h>
 +#include <arm64/proc_reg.h>
++#include <pexpert/pexpert.h>
  
 -static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
 +#if SWEET_BOARD_PI5
@@ -285,7 +343,43 @@ index 6928957..c0458d6 100644
  #define EARLY_SCALE 2u
  #define EARLY_CELL_W (8u * EARLY_SCALE)
  #define EARLY_CELL_H (16u * EARLY_SCALE)
-@@ -125,10 +137,39 @@ sweet_early_panic(const char *fmt, va_list *args)
+@@ -27,6 +40,8 @@ extern unsigned char iso_font[256 * 16];
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
++/* Pi 5: final framebuffer VA not translating yet (stage 8b); retried after stage 11. */
++static unsigned int early_suspended;
+ 
+ static void
+ sweet_early_clear_row(void)
+@@ -42,7 +57,7 @@ sweet_early_clear_row(void)
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled || early_suspended) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -89,7 +104,7 @@ sweet_early_string(const char *s)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if (early_disabled || early_suspended || stage > 20) {
+ 		return;
+ 	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+@@ -112,7 +127,7 @@ sweet_early_mark(unsigned int stage, const char *label)
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	if (early_disabled || early_suspended || early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
+@@ -125,10 +140,53 @@ sweet_early_panic(const char *fmt, va_list *args)
  	__asm__ volatile("dsb sy" ::: "memory");
  }
  
@@ -321,11 +415,25 @@ index 6928957..c0458d6 100644
 +	sweet_early_string(" want PA ");
 +	sweet_early_hex(early_fb_pa);
 +	sweet_early_putc('\n');
++	/* -sweet_fb_defer forces the deferred path, to test it in QEMU. */
++	if ((par & 1) || PE_parse_boot_argn("-sweet_fb_defer", NULL, 0)) {
++		/*
++		 * Real Pi 5 (8ffdc02): PAR 0xd = level 2 translation fault, while QEMU
++		 * translates. Do not draw through a missing mapping (that hung the
++		 * boot): pause, and let arm_vm_init rewrite the entry through the
++		 * final tables after stage 11 (sweet_early_resume).
++		 */
++		sweet_early_string("SWEET EARLY 8c: fault; console paused until stage 11\n");
++		early_fb = (volatile uint32_t *)(uintptr_t)base;
++		early_suspended = 1;
++		__asm__ volatile("dsb sy" ::: "memory");
++		return;
++	}
 +#endif
  	early_fb = (volatile uint32_t *)(uintptr_t)base;
  	__asm__ volatile("dsb sy" ::: "memory");
  	sweet_early_mark(9, "kernel framebuffer VA live");
-@@ -140,4 +181,32 @@ sweet_early_disable(void)
+@@ -140,4 +198,67 @@ sweet_early_disable(void)
  	early_disabled = 1;
  	__asm__ volatile("dsb sy" ::: "memory");
  }
@@ -356,19 +464,56 @@ index 6928957..c0458d6 100644
 +{
 +	return early_disabled ? 0 : early_fb_pa;
 +}
++
++int
++sweet_early_suspended(void)
++{
++	return !early_disabled && early_suspended;
++}
++
++/*
++ * arm_vm_init after stage 11, once arm_vm_init rewrote the framebuffer block
++ * entry through the final page tables and flushed the TLB: draw again if the
++ * MMU now translates the VA, else give up on the early console (the
++ * sweet-fbcon serial console takes over at serial_init).
++ */
++void
++sweet_early_resume(uint64_t l1, uint64_t slot_before, uint64_t slot_now)
++{
++	uint64_t par;
++	uint64_t va = (uint64_t)(uintptr_t)early_fb;
++	__asm__ volatile ("at s1e1w, %1\n isb\n mrs %0, par_el1" : "=r"(par) : "r"(va) : "memory");
++	if (par & 1) {
++		sweet_early_disable();
++		return;
++	}
++	early_suspended = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_string("SWEET EARLY 11b: fb VA live after retry, PAR ");
++	sweet_early_hex(par);
++	sweet_early_string("\n  L1 ");
++	sweet_early_hex(l1);
++	sweet_early_string(" slot before ");
++	sweet_early_hex(slot_before);
++	sweet_early_string(" now ");
++	sweet_early_hex(slot_now);
++	sweet_early_putc('\n');
++}
 +#endif
  #endif /* SWEET */
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index d7a25f2..8f1a404 100644
+index d7a25f2..53e387a 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -12,6 +12,10 @@ void sweet_early_putc(char c);
+@@ -12,6 +12,12 @@ void sweet_early_putc(char c);
  void sweet_early_panic(const char *fmt, va_list *args);
  void sweet_early_relocate(uint64_t base);
  void sweet_early_disable(void);
 +#if SWEET_BOARD_PI5
 +void sweet_early_set_fb(uint64_t base, uint64_t width, uint64_t height, uint64_t row_bytes, uint64_t depth);
 +uint64_t sweet_early_fb_pa(void);       /* 0 = early console off */
++int sweet_early_suspended(void);
++void sweet_early_resume(uint64_t l1, uint64_t slot_before, uint64_t slot_now);
 +#endif
  #else
  static inline void sweet_early_mark(unsigned int stage, const char *label)
