@@ -17,6 +17,10 @@ args=(-M virt,gic-version=2,virtualization=on,secure=off
 	-nographic -no-reboot -nic none
 	-kernel out/ios-pi5-shim.img)
 [ -n "$payload" ] && args+=(-initrd "$payload")
+# Extra QEMU options, e.g. QEMU_EXTRA="-accel tcg,thread=single -icount shift=auto,sleep=off"
+# (guest time follows executed instructions: no host-timing lock timeouts).
+# shellcheck disable=SC2206
+[ -n "${QEMU_EXTRA:-}" ] && args+=($QEMU_EXTRA)
 
 if [ -z "${FBDUMP:-}" ]; then
 	timeout --foreground "$secs" qemu-system-aarch64 "${args[@]}" || true

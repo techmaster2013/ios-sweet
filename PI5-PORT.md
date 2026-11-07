@@ -155,7 +155,42 @@ console off). Suspected: that mapping, or the fault it causes with no
 console left to report it. Commit b637d1d: Pi 5 early console from
 boot_args->Video at runtime (start.s, arm_vm_init, sweet_early, arm_init),
 QEMU fake framebuffer at 0x7e000000 from the shim, `FBDUMP=x.png qemu.sh`
-to see it. Run 42385393260 building.
+to see it. Run 42385393260: QEMU draws stages 1-20 with the fake fb, also at
+0x7f400000 (= the Pi's 0x1400000 offset inside its 32 MB block).
+
+**Second real-Pi boot (8ffdc02, adds the 8b MMU check):** stops after
+`SWEET EARLY 8b: fb VA 0xfffffe0003400000 PAR 0x000000000000000d want PA
+0x000000003f400000`: PAR.F=1, FST 0b000110 = level 2 translation fault right
+after the TTBR1 switch, although sweet_early_map_final wrote the block entry.
+QEMU (same code, same offset) translates: PAR 0x440000007f400b00.
+Hardware-only: either the walker does not see that write (cache/attribute
+of the bootstrap-aperture alias it went through) or the final L1 entry
+points at another L2 table on this memory layout. Commit cf66a8a: on a
+fault the early console pauses ("8c") instead of hanging; after stage 11 the
+entry is rewritten through the final tables + TLB flush and re-checked
+("11b" prints the L1 entry and the slot before/after, which tells the two
+causes apart); still faulting = early console off, boot continues.
+`-sweet_fb_defer` forces that path for QEMU. Run 42388647441 (cf66a8a):
+with `-sweet_fb_defer` QEMU boots on 4 CPUs to the root-device wait, so the
+pause/retry/resume path works.
+
+**QEMU 4-CPU panic, not a kernel bug:** most multi-threaded-TCG boots of
+cf66a8a (normal and deferred alike) panic soon after "4/4 CPUs" with
+`Ticket spinlock[0xfffffe0007b90880] timeout` = `_pset0+0x100`
+(tools/macho_sym.py), waiter called from thread_select; the panicking CPU
+also could not stop the others (DebuggerXCall). Not a missed WFE wakeup
+(wfe_timeout_init runs on every CPU: 1 us event stream) and not host CPU
+starvation (WSL has 12 cores). Single-threaded TCG with
+`-icount shift=auto,sleep=off` (guest time = instructions executed) boots
+4 CPUs cleanly to the root wait: the lock "timeouts" are emulation timing.
+Use `QEMU_EXTRA="-accel tcg,thread=single -icount shift=auto,sleep=off"
+qemu.sh` for SMP checks. Bring-up boot-args no longer have
+`-enable_kprintf_spam`: kprintf is synchronous on the 115200 baud UART and
+some of that output comes from inside the scheduler.
+
+Pi payload (cf66a8a, cmdline `debug=0xc serial=3 cpus=4 keepsyms=1
+-noprogress -v interrupt-masked-debug-mode=1`): out-pi5/payload.bin,
+16607168 bytes, sha256 be5e82db...
 
 Next: `gh workflow run xnu.yml -R techmaster2013/ios-sweet --ref pi5-port -f board=pi5`, then
 `mkpayload.py KERNEL out-pi5/pi5-qemu.adt payload.bin --cmdline "debug=0x8 serial=3 cpus=1 -v"`

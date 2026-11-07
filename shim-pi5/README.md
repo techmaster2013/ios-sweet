@@ -57,7 +57,7 @@ python3 tools/mkadt_pi5.py out-pi5/pi5.adt
 ```
 
 ```bash
-python3 tools/mkpayload.py xnu/out-pi5-XXXX/kernel.development.sweet out-pi5/pi5.adt out-pi5/payload.bin --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam -noprogress -v interrupt-masked-debug-mode=1"
+python3 tools/mkpayload.py xnu/out-pi5-XXXX/kernel.development.sweet out-pi5/pi5.adt out-pi5/payload.bin --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress -v interrupt-masked-debug-mode=1"
 ```
 
 On the SD card: copy `out-pi5/payload.bin` next to the shim and add one line
