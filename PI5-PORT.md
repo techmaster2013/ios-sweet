@@ -327,3 +327,22 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
 - Driver shape: copy bsd/dev/sweet_ufs.c's interface (bdevsw/cdevsw,
   strategy with partition bounds checks, devfs nodes, root via rd=), with
   SDHCI PIO transfers first (DMA later).
+
+## Stage 3 build environment (WSL2, 2026-11-07)
+
+- IPSW iPadOS 16.6.1 (20G81) in the user's Downloads (5727423701 bytes, size
+  matches ipsw.me). BuildManifest, identity j71bap: OS 096-56598-083.dmg,
+  Cryptex1,SystemOS 096-57766-083.dmg, Cryptex1,AppOS 096-57613-084.dmg,
+  DeviceTree Firmware/all_flash/DeviceTree.j71bap.im4p. Extracted to
+  ~/pi5-build/ipsw in WSL (not in git).
+- /sbin/launchd is plain arm64 (not arm64e): runs on the A76 without PAC.
+- Root steps run with `wsl -u root` (user approved 2026-11-07; no sudo
+  password involved).
+- apfs-fuse (sgan81, built in ~/pi5-build/apfs-fuse/build) needs, with
+  CMake 4 / GCC 15: -DCMAKE_POLICY_VERSION_MINIMUM=3.5, and `#include
+  <cstdint>` + `<vector>` at the top of ApfsLib/PList.cpp.
+- HFS+: WSL's kernel has no CONFIG_HFSPLUS_FS. tools/wsl-hfsplus.sh builds
+  hfsplus.ko for the running kernel (6.18.58.1-microsoft-standard-WSL2) with
+  gcc-13 + gcc-13-plugin-dev; a GCC 15 build is rejected ("disagrees about
+  version of symbol module_layout"). Reload with `wsl-hfsplus.sh load` after
+  each WSL restart. Verified: mkfs.hfsplus + loop mount + write + read back.
