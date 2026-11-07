@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..0bfa24a 100644
+index 2545cf9..f65d273 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -20,6 +20,9 @@
@@ -12,7 +12,32 @@ index 2545cf9..0bfa24a 100644
  
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
-@@ -214,6 +217,11 @@ SweetCPU::signalCPU(IOCPU *target)
+@@ -73,16 +76,21 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if SWEET_BOARD_PI5
++	/* Pi 5: MPIDR Aff1 = core, 0x000-0x300. QEMU virt: Aff0 = core, 0x0-0x3. */
++	bool bad_mpidr = (cpu->phys_id & 0xff) == 0 ? cpu->phys_id > 0x300 : cpu->phys_id > 0x3;
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	bool bad_mpidr = cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0;
++#endif
++	if (bad_mpidr || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy(SWEET_BOARD_PI5 ? "Cortex-A76" : "Kryo 470");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -214,6 +222,11 @@ SweetCPU::signalCPU(IOCPU *target)
  	if (logical >= topology->num_cpus) {
  		panic("SWEET CPU: invalid SGI target %u", logical);
  	}

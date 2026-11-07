@@ -83,7 +83,33 @@ Known risks to check on the first real boot:
 - Untested assumption: GIC-400 CPU interface n = core n (fallback when a CPU
   has not stored its ITARGETSR mask yet).
 
-Next: GitHub fork + `gh workflow run xnu.yml -f board=pi5`, then
+CI (2026-11-07): fork `techmaster2013/ios-sweet`, branch `pi5-port`
+(commits efea060 Pi 5 work, 8115044 runner input). The fork listed 0
+workflows until an empty commit was pushed to its `main` (3a897f6).
+Run 42376275793 was cancelled before any step: GitHub no longer offers
+macos-14 ("configuration 'macos-14-arm64-us-default' is not supported";
+upstream's last green runs were 2026-10-18). xnu.yml now has
+`runner` (default macos-15); Deps picks the oldest Xcode on the image and
+the build needs an Xcode 15 iig. Run 42376477421 (board=pi5,
+runner=macos-15) **succeeded** with Xcode 16.0 (16A242d): its iig did not
+break this tree. Patch 0101 applied, `SWEET_BOARD_PI5=1` in the flags
+(grep count 1), kernel.development.sweet 17188656 bytes, plain arm64 PIE,
+sha256 0beca9de...fcfac, contains "SWEET GIC: GICv2" and the new match rules
+(local copy: xnu/out-pi5-0101/).
+
+First QEMU boot (out-pi5/qemu-0101.log, payload from
+`mkadt_pi5.py --qemu` + mkpayload, cmdline `debug=0xc serial=3 cpus=1
+keepsyms=1 -enable_kprintf_spam -noprogress -v`): shim found the payload
+(10 segs, phys 0x100000000, entry 0xfffffe000748c488), jumped at EL1;
+xnu faulted at once in start.s stage 0: ESR 0x96000050 (external abort,
+write), FAR 0x3fbad000 = the early-console marker band at
+0x3f400000 + (1080-32)*7680, PCIe ECAM in QEMU virt. Fix (commit c886dcd,
+in 0101): on Pi 5, start.s stage 0 and the sweet_early_* console run only if
+boot_args->Video.v_baseAddr == SWEET_EARLY_FB_PA (the shim reports 0 in
+QEMU). Also protects a real Pi whose HDMI mode moves the framebuffer.
+Run 42377501437 (c886dcd) building.
+
+Next: `gh workflow run xnu.yml -R techmaster2013/ios-sweet --ref pi5-port -f board=pi5`, then
 `mkpayload.py KERNEL out-pi5/pi5-qemu.adt payload.bin --cmdline "debug=0x8 serial=3 cpus=1 -v"`
 and `shim-pi5/qemu.sh 60 payload.bin`.
 

@@ -81,16 +81,18 @@ def build(qemu=False, seed=None):
     ], [node('memory-map', [ph()]),
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # 4x Cortex-A76. reg = MPIDR Aff1:Aff0 as the hardware reports it
-    # (0x000/0x100/0x200/0x300: core number in Aff1, MT=1). XNU matches CPUs
-    # by this value and numbers them in DT order.
+    # 4x Cortex-A76. reg = MPIDR Aff1:Aff0 as the hardware reports it, and
+    # the PSCI CPU_ON target: Pi 5 0x000/0x100/0x200/0x300 (core in Aff1,
+    # MT=1); QEMU virt 0x0/0x1/0x2/0x3 (core in Aff0; with 0x100 QEMU's PSCI
+    # returns INVALID_PARAMETERS). XNU numbers CPUs in DT order.
+    mpidr = (lambda core: core) if qemu else (lambda core: core << 8)
     cpu_nodes = []
     for core in range(4):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('arm,cortex-a76') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),
+            ('reg', u32(mpidr(core))),
             ('cpu-id', u32(core)),
             ('cluster-id', u32(0)),
             ('cluster-type', u32(0)),
