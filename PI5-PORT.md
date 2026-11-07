@@ -306,3 +306,24 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   (the official Raspberry Pi Debug Probe fits it), HDMI monitor, USB keyboard + mouse.
 - A GitHub fork for the macOS CI kernel build (`.github/workflows/xnu.yml`).
 - Linux (WSL2 is fine) for the shim cross-compile and building the root image.
+
+## Stage 3 hardware facts (from bcm2712-rpi-5-b.dtb on the card, 2026-11-07)
+
+- SD slot: `/soc@107c000000/mmc@fff000`, compatible `brcm,bcm2712-sdhci`
+  `brcm,sdhci-brcmstb`; reg "host" 0xfff000 + 0x260, "cfg" 0xfff400 + 0x200
+  inside soc@107c000000 = PA 0x107cfff000 / 0x107cfff400. Interrupt SPI
+  0x111 (level). Clock `clk-emmc2` fixed 200 MHz. bus-width 4, UHS
+  SDR50/DDR50/SDR104, card detect on aon_gpio5. The firmware leaves the card
+  initialized (it loaded payload.bin from it), possibly in 1.8 V UHS
+  signalling: a full re-init (CMD0...) must keep Host Control 2's 1.8 V bit
+  as found, since the card stays at 1.8 V until power is cut.
+- Wi-Fi: `/axi/mmc@1100000`, same `brcm,bcm2712-sdhci`, PA 0x1001100000 /
+  0x1001100400, SPI 0x112, non-removable, child `wifi@1` (CYW43455 over
+  SDIO). On the SoC, not behind PCIe/RP1: the SD driver's host code is
+  reusable for Wi-Fi.
+- Card partitions are MBR (bootfs FAT32 512 MB, rootfs ext4 2.5 GB, rest of
+  the 64 GB unallocated). Plan: MBR partition 3 of type 0xAF (HFS+) for the
+  iPadOS root, found by type like sweet_ufs finds its GPT partition by name.
+- Driver shape: copy bsd/dev/sweet_ufs.c's interface (bdevsw/cdevsw,
+  strategy with partition bounds checks, devfs nodes, root via rd=), with
+  SDHCI PIO transfers first (DMA later).
