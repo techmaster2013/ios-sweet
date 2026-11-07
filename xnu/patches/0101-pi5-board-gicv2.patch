@@ -44,6 +44,24 @@ index 92f3e26..dd26cb2 100644
      "     'IOProbeScore'    = 10000:32;"
      "   },"
      "   {"
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..2c41b8e 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,13 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if SWEET_BOARD_PI5
++	/* Same rule as start.s stage 0: no early framebuffer console unless the
++	 * shim reported the firmware framebuffer at the expected address. */
++	if (args->Video.v_baseAddr != (unsigned long)SWEET_EARLY_FB_PA) {
++		sweet_early_disable();
++	}
++#endif
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index 06bb568..00f3d22 100644
 --- a/osfmk/arm64/arm_vm_init.c
@@ -114,7 +132,7 @@ index 24f1abc..ec9b26d 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 023086f..c2d3157 100644
+index 023086f..4ba78aa 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -306,11 +306,13 @@ LEXT(sweet_secondary_entry)
@@ -131,9 +149,22 @@ index 023086f..c2d3157 100644
  	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
  	MOV64	x1, 0x30d00800
  	msr		SCTLR_EL1, x1
-@@ -515,10 +517,10 @@ LEXT(start_first_cpu)
+@@ -514,11 +516,23 @@ LEXT(start_first_cpu)
+ 	mov		x21, #0
  
  #if defined(SWEET)
++#if SWEET_BOARD_PI5
++	/*
++	 * Pi 5: draw only if the shim found the firmware framebuffer exactly
++	 * where the early console expects it (boot_args->Video.v_baseAddr).
++	 * QEMU (no framebuffer: 0) or another HDMI mode would otherwise have
++	 * us write into PCIe ECAM or RAM.
++	 */
++	ldr		x0, [x20, #40]
++	MOV64	x1, SWEET_EARLY_FB_PA
++	cmp		x0, x1
++	b.ne	Lsweet_mark_done
++#endif
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
 -	MOV64	x0, (0x9c000000 + 2368 * 4320)
 +	MOV64	x0, (SWEET_EARLY_FB_PA + (SWEET_EARLY_FB_H - 32) * SWEET_EARLY_FB_STRIDE)
@@ -144,7 +175,15 @@ index 023086f..c2d3157 100644
  Lsweet_mark_row:
  	mov		x3, #64
  	mov		x5, x0
-@@ -686,7 +688,7 @@ Lkernelcache_base_found:
+@@ -530,6 +544,7 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++Lsweet_mark_done:
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -686,7 +701,7 @@ Lkernelcache_base_found:
  	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
  	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
  	 */
