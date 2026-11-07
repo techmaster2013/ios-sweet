@@ -253,7 +253,7 @@ index 023086f..54e5b63 100644
  
  	/* Ensure TTEs are visible */
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
-index 6928957..bbf723d 100644
+index 6928957..c0458d6 100644
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
 @@ -10,12 +10,24 @@
@@ -285,7 +285,47 @@ index 6928957..bbf723d 100644
  #define EARLY_SCALE 2u
  #define EARLY_CELL_W (8u * EARLY_SCALE)
  #define EARLY_CELL_H (16u * EARLY_SCALE)
-@@ -140,4 +152,32 @@ sweet_early_disable(void)
+@@ -125,10 +137,39 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++#if SWEET_BOARD_PI5
++static void
++sweet_early_hex(uint64_t v)
++{
++	sweet_early_string("0x");
++	for (int i = 60; i >= 0; i -= 4) {
++		unsigned int d = (unsigned int)(v >> i) & 0xf;
++		sweet_early_putc((char)(d < 10 ? '0' + d : 'a' + d - 10));
++	}
++}
++#endif
++
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
++#if SWEET_BOARD_PI5
++	/*
++	 * Real Pi 5 (kernel 23d34a5) stopped right here: stage 9 is the first
++	 * draw through this VA. Ask the MMU what the VA translates to and print
++	 * it through the still-working VA=PA alias first. PAR_EL1 bit 0 = fault
++	 * (FST in [6:1]); otherwise PA in [47:12], memory attributes in [63:56].
++	 */
++	uint64_t par;
++	__asm__ volatile ("at s1e1w, %1\n isb\n mrs %0, par_el1" : "=r"(par) : "r"(base) : "memory");
++	sweet_early_string("SWEET EARLY 8b: fb VA ");
++	sweet_early_hex(base);
++	sweet_early_string(" PAR ");
++	sweet_early_hex(par);
++	sweet_early_string(" want PA ");
++	sweet_early_hex(early_fb_pa);
++	sweet_early_putc('\n');
++#endif
+ 	early_fb = (volatile uint32_t *)(uintptr_t)base;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+@@ -140,4 +181,32 @@ sweet_early_disable(void)
  	early_disabled = 1;
  	__asm__ volatile("dsb sy" ::: "memory");
  }

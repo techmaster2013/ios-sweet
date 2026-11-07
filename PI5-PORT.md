@@ -137,8 +137,25 @@ Real-Pi payload ready: out-pi5/payload.bin (16590368 bytes, sha256 85c67008...,
 kernel 23d34a5 + `mkadt_pi5.py` Pi ADT, cmdline `debug=0xc serial=3 cpus=4
 keepsyms=1 -enable_kprintf_spam -noprogress -v interrupt-masked-debug-mode=1`).
 Needs `initramfs payload.bin followkernel` in config.txt (shim-pi5/README.md).
-The current SD card cannot create new files (FAT damage, see chat
-2026-11-07): reuse an existing file or re-flash.
+SD card fixed 2026-11-07: bootfs (disk 1 partition 1) backed up to
+`../sdcard-backup/bootfs` (434 files, hash-verified), quick-formatted FAT32
+(now Healthy, creates files again), restored (hash-verified), plus
+ios-pi5-shim.img and payload.bin; config.txt block "ios-pi5 stage 2" =
+`kernel=ios-pi5-shim.img` + `initramfs payload.bin followkernel`.
+
+**First real-Pi xnu boot (kernel 23d34a5, photo 2026-11-07):** shim found
+the payload at 0x2e02d000-0x2efff620 (10 segs, phys 0x40000000 + 0xbff00000),
+ADT 0x424c4000, boot_args 0x424c8000, jumped to 0x4148c488. xnu's early
+console on HDMI printed SWEET EARLY 1-8 (arm_init, PE_init_platform,
+ml_parse_cpu_topology, cpu_bootstrap, kernel_startup_bootstrap, cpu_init,
+entering arm_vm_init, leaving bootstrap TTBR0); the stage bar ends at
+segment 8. Stage 9 is the first draw through the final kernel mapping of the
+framebuffer (sweet_early_relocate), a path QEMU never ran (no framebuffer,
+console off). Suspected: that mapping, or the fault it causes with no
+console left to report it. Commit b637d1d: Pi 5 early console from
+boot_args->Video at runtime (start.s, arm_vm_init, sweet_early, arm_init),
+QEMU fake framebuffer at 0x7e000000 from the shim, `FBDUMP=x.png qemu.sh`
+to see it. Run 42385393260 building.
 
 Next: `gh workflow run xnu.yml -R techmaster2013/ios-sweet --ref pi5-port -f board=pi5`, then
 `mkpayload.py KERNEL out-pi5/pi5-qemu.adt payload.bin --cmdline "debug=0x8 serial=3 cpus=1 -v"`

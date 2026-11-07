@@ -15,7 +15,7 @@
 
 #define UART10_FALLBACK		0x107d001000UL	/* bcm2712 debug UART (JST header) */
 #define NR_CPUS			4
-#define QEMU_FAKE_FB		0x7e000000UL	/* QEMU virt RAM, below payload/kernel use */
+#define QEMU_FAKE_FB		0x7f400000UL	/* QEMU virt RAM; same 32MB-block offset (0x1400000) as the Pi 5 fb */
 
 /* GICv2 (GIC-400) */
 #define GICD_CTLR		0x000

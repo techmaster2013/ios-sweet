@@ -2,7 +2,7 @@
 # Smoke-test the shim in QEMU with a Pi 5-like setup: 4x Cortex-A76, 8 GB,
 # GICv2, entry at EL2 (virtualization=on), PSCI over smc. Output is the PL011
 # on stdout. QEMU virt has no framebuffer: the shim reports a fake 1920x1080
-# one at 0x7e000000 (guest RAM) so xnu's early console runs as on a Pi.
+# one at 0x7f400000 (guest RAM, same in-block offset as the Pi) so xnu's early console runs as on a Pi.
 #
 # Usage: [FBDUMP=out.png] qemu.sh [SECONDS] [PAYLOAD]
 #   no payload: stage 1 checks
@@ -33,7 +33,7 @@ import socket, sys, time
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 time.sleep(0.3)
-s.sendall(f'pmemsave 0x7e000000 {1920 * 1080 * 4} "{sys.argv[2]}"\n'.encode())
+s.sendall(f'pmemsave 0x7f400000 {1920 * 1080 * 4} "{sys.argv[2]}"\n'.encode())
 time.sleep(2)
 s.sendall(b'quit\n')
 time.sleep(0.5)
