@@ -849,10 +849,10 @@ index 92f3e26..dd26cb2 100644
      "   },"
      "   {"
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index e6c74aa..0c082c7 100644
+index e6c74aa..af3ae5c 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -782,6 +782,22 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -782,6 +782,21 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  		*oflags = 0;
  		goto iofrootx;
  	}
@@ -867,8 +867,7 @@ index e6c74aa..0c082c7 100644
 +			panic("IOFindBSDRoot: SWEET SD root %s unavailable: %d", rdBootVar, sd_error);
 +		}
 +		strlcpy(rootName, rdBootVar, rootNameSize);
-+		IOLog("BSD root: %s, major %d, minor %d
-+", rootName, major(*root), minor(*root));
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
 +		*oflags = 0;
 +		goto iofrootx;
 +	}
