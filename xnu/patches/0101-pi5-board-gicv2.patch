@@ -1,18 +1,43 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..f65d273 100644
+index 2545cf9..51ff132 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -20,6 +20,9 @@
+@@ -20,6 +20,34 @@
  
  extern "C" void sweet_secondary_entry(void);
  extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
 +#if SWEET_GICV2
 +extern "C" void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++extern "C" uint32_t sweet_gic_sgi_rx(unsigned int cpu);
++extern "C" uint32_t sweet_gic_cpu_mask(unsigned int cpu);
++
++/*
++ * Real Pi 5: cpus=1 boots to the root-device wait, cpus=4 hangs right after
++ * "ifnet_attach ... lo0 ... Proceeding". The SGI1 check in startAll only
++ * proves each CPU can signal itself. Signal every CPU from this thread and
++ * report whether its sleh_irq saw it, without hanging if one is lost.
++ */
++static void
++sweet_ipi_matrix(unsigned int ncpus)
++{
++	for (unsigned int t = 0; t < ncpus; t++) {
++		unsigned int src = cpu_number();
++		uint32_t before = sweet_gic_sgi_rx(t);
++		sweet_gic_send_sgi(t, SWEET_IPI_SGI);
++		uint64_t deadline;
++		nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &deadline);
++		while (sweet_gic_sgi_rx(t) == before && mach_absolute_time() < deadline) {
++			;
++		}
++		IOLog("SWEET IPI: cpu %u -> cpu %u (mask 0x%x): %s\n", src, t,
++		    sweet_gic_cpu_mask(t), sweet_gic_sgi_rx(t) != before ? "OK" : "LOST");
++	}
++}
 +#endif
  
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
-@@ -73,16 +76,21 @@ SweetCPU::start(IOService *provider)
+@@ -73,16 +101,21 @@ SweetCPU::start(IOService *provider)
  	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
  		return false;
  	}
@@ -37,7 +62,17 @@ index 2545cf9..f65d273 100644
  	if (cpuName == NULL) {
  		return false;
  	}
-@@ -214,6 +222,11 @@ SweetCPU::signalCPU(IOCPU *target)
+@@ -175,6 +208,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++#if SWEET_GICV2
++	sweet_ipi_matrix(topology->num_cpus);
++#endif
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -214,6 +250,11 @@ SweetCPU::signalCPU(IOCPU *target)
  	if (logical >= topology->num_cpus) {
  		panic("SWEET CPU: invalid SGI target %u", logical);
  	}
@@ -185,7 +220,7 @@ index 06bb568..018eaab 100644
  	// From here on out, we're off the bootstrap translation tables.
  
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 24f1abc..ec9b26d 100644
+index 24f1abc..47dac2f 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -1861,8 +1861,16 @@ sleh_irq(arm_saved_state_t *state)
@@ -205,7 +240,7 @@ index 24f1abc..ec9b26d 100644
  
  	if (intid >= 1020 && intid <= 1023) {
  		return; /* spurious */
-@@ -1873,11 +1881,11 @@ sleh_irq(arm_saved_state_t *state)
+@@ -1873,12 +1881,15 @@ sleh_irq(arm_saved_state_t *state)
  		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
  		rtclock_intr(TRUE);
  		INTERRUPT_MASKED_DEBUG_END();
@@ -217,9 +252,13 @@ index 24f1abc..ec9b26d 100644
 -		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
 +		SWEET_GIC_EOI(iar);
  		__builtin_arm_isb(ISB_SY);
++#if SWEET_GICV2
++		sweet_gic_note_sgi();   /* per-CPU count for the SweetCPU IPI test */
++#endif
  		cpu_signal_handler();
  	} else {
-@@ -1888,9 +1896,10 @@ sleh_irq(arm_saved_state_t *state)
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+@@ -1888,9 +1899,10 @@ sleh_irq(arm_saved_state_t *state)
  			    cdp->interrupt_nub,
  			    intid);
  		}
@@ -519,10 +558,10 @@ index d7a25f2..53e387a 100644
  static inline void sweet_early_mark(unsigned int stage, const char *label)
  {
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..553845d 100644
+index 6089db9..1e949f9 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -222,6 +222,130 @@ pe_init_fiq()
+@@ -222,6 +222,157 @@ pe_init_fiq()
  	__builtin_arm_isb(ISB_SY);
  #endif /* SWEET */
  }
@@ -622,7 +661,34 @@ index 6089db9..553845d 100644
 +	gic_write32(gicc_base + GICC_CTLR, 1);
 +	__builtin_arm_dsb(DSB_SY);
 +	__builtin_arm_isb(ISB_SY);
-+	kprintf("SWEET GIC: cpu %u interface mask 0x%x\n", cpu, mask);
++	/* IGROUPR0 (banked): set bit = Group 1 = deliverable to us from the non-secure side. */
++	kprintf("SWEET GIC: cpu %u interface mask 0x%x IGROUPR0 0x%08x GICC_CTLR 0x%x GICD_CTLR 0x%x\n",
++	    cpu, mask, gic_read32(gicd_base + GICD_IGROUPR), gic_read32(gicc_base + GICC_CTLR),
++	    gic_read32(gicd_base + GICD_CTLR_V2));
++}
++
++/* SGIs taken per CPU (sleh_irq), for the cross-CPU IPI test in SweetCPU. */
++static uint32_t gic_sgi_rx[SWEET_SMP_MAX_CPUS];
++
++void
++sweet_gic_note_sgi(void)
++{
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (cpu < SWEET_SMP_MAX_CPUS) {
++		os_atomic_inc(&gic_sgi_rx[cpu], relaxed);
++	}
++}
++
++uint32_t
++sweet_gic_sgi_rx(unsigned int cpu)
++{
++	return cpu < SWEET_SMP_MAX_CPUS ? os_atomic_load(&gic_sgi_rx[cpu], relaxed) : 0;
++}
++
++uint32_t
++sweet_gic_cpu_mask(unsigned int cpu)
++{
++	return cpu < SWEET_SMP_MAX_CPUS ? gic_cpu_mask[cpu] : 0;
 +}
 +
 +uint32_t
@@ -670,10 +736,10 @@ index 19f27cd..a63c47a 100644
  	VMAPPLE_UART0_ICR = PL011_ICR_CLR_ALL_IRQS;
  	VMAPPLE_UART0_CR = (
 diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
-index 9004f2b..9356730 100644
+index 9004f2b..9cebbb9 100644
 --- a/pexpert/pexpert/arm/protos.h
 +++ b/pexpert/pexpert/arm/protos.h
-@@ -38,6 +38,12 @@ int uart_getc(void);
+@@ -38,6 +38,15 @@ int uart_getc(void);
  void pe_init_fiq(void);
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  extern uint32_t sweet_vtimer_intid;
@@ -682,12 +748,15 @@ index 9004f2b..9356730 100644
 +uint32_t sweet_gic_ack(void);
 +void sweet_gic_eoi(uint32_t iar);
 +void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++void sweet_gic_note_sgi(void);
++uint32_t sweet_gic_sgi_rx(unsigned int cpu);
++uint32_t sweet_gic_cpu_mask(unsigned int cpu);
 +#endif
  #endif
  
  #ifdef PRIVATE
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
-index b99c2f4..917bbdd 100644
+index b99c2f4..38d6c91 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
 @@ -17,6 +17,23 @@
@@ -753,7 +822,7 @@ index b99c2f4..917bbdd 100644
  
  #ifndef ASSEMBLER
  #define PLATFORM_PANIC_LOG_DISABLED
-@@ -47,9 +88,28 @@
+@@ -47,9 +88,29 @@
   * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
   * (CNTV) is INTID 16 + 3 = 19.
   */
@@ -767,6 +836,7 @@ index b99c2f4..917bbdd 100644
 +#if SWEET_GICV2
 +/* GICv2 / GIC-400 (Arm IHI 0048B), non-secure view: everything is Group 1. */
 +#define GICD_CTLR_V2              0x000
++#define GICD_IGROUPR              0x080
 +#define GICD_ISENABLER            0x100
 +#define GICD_IPRIORITYR           0x400
 +#define GICD_ITARGETSR            0x800
