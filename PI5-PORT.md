@@ -207,6 +207,23 @@ Pi payload (cf66a8a, cmdline `debug=0xc serial=3 cpus=4 keepsyms=1
   test after "4/4" and per-CPU IGROUPR0/GICC_CTLR/GICD_CTLR in the "SWEET
   GIC: cpu N" lines. Run 42398055028 building.
 
+**STAGE 2 DONE ON REAL HARDWARE, 4 CPUs (b2646a6, photo 2026-11-07):**
+"SWEET IPI: cpu 2 -> cpu 1/2/3: OK", then lo0, gif0 and stf0 attach,
+`Waiting on <dict> IOMedia Apple_HFS`, "Failed to write
+boot-picker-bringup-reason to NVRAM", "mcache: 4 CPU(s)". Lesson: the
+sweet-fbcon console wraps to the top instead of scrolling (the newest line
+is the one above the blank row, not the bottom one), so the earlier
+"hangs after lo0" report for cf66a8a was probably a wrapped screen, not a
+hang. Commit 8f4b278 (per-CPU timer check, run 42401147347) was started
+before this result and is no longer needed for stage 2.
+
+Next: stage 3 (root file system). iPad (6th generation, Wi-Fi) iPad7,5
+iPadOS 16.7.x IPSW downloaded by the user; SDHCI driver for the BCM2712 SD
+slot; HFS+ root partition in the unused space of the 64 GB card;
+tools/mkiosroot.sh in WSL. IPSW: iPadOS 16.6.1 (20G81), the newest 16.x
+for iPad7,5 (it went to 17.x after that; 17 does not match xnu-8796),
+iPad_64bit_TouchID_ASTC_16.6.1_20G81_Restore.ipsw, 5727423701 bytes.
+
 Next: `gh workflow run xnu.yml -R techmaster2013/ios-sweet --ref pi5-port -f board=pi5`, then
 `mkpayload.py KERNEL out-pi5/pi5-qemu.adt payload.bin --cmdline "debug=0x8 serial=3 cpus=1 -v"`
 and `shim-pi5/qemu.sh 60 payload.bin`.
