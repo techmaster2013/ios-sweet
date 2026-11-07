@@ -1,0 +1,167 @@
+# iPadOS 16 on Raspberry Pi 5 (8 GB): porting plan
+
+Fork of ios-sweet. Goal: boot the iPadOS 16 userland on a Pi 5 with HDMI output
+and a USB keyboard and mouse (landscape, external HID).
+
+Status (2026-11-06): stage 1 shim in `shim-pi5/` builds cleanly with
+gcc-aarch64-linux-gnu in WSL (`out/ios-pi5-shim.img`, 84 KiB, valid arm64
+header, no relocations, no libc calls).
+
+QEMU (2026-11-06, `shim-pi5/qemu.sh`: virt, gic-version=2, virtualization=on,
+secure=off, 4x cortex-a76, 8 GB): **STAGE 1 PASSED, 0 failures.** Entered at
+EL2, running at EL1; 16K granule yes, PAC no, GIC sysregs no; GICv2 vtimer
+INTID 27 = 28 IRQs / 300 ms; PSCI 1.1 over smc; cpu1-3 started by CPU_ON,
+each also entered at EL2 and dropped to EL1. QEMU does not cover: the HDMI
+simple-framebuffer, the real Pi firmware's entry state and UART setup, or
+GIC-400 security extensions (QEMU ran with secure=off).
+
+**Real Pi 5 8 GB (2026-11-07): STAGE 1 PASSED, 0 checks failed** (user report;
+shim booted as `kernel8.img` from the Pi OS Lite bootfs; values read from a
+photo of the HDMI report). Next: stage 2 (XNU board config + GICv2 driver).
+
+## Stage 2 design (2026-11-07)
+
+- Build stays `MACHINE_CONFIG=SWEET`: ~100 `ARM64_BOARD_CONFIG_SWEET` gates,
+  `MASTER.arm64.sweet` and the 3 makefile checks (0004, 0019, 0020) then apply
+  unchanged. The Pi 5 is selected by one extra compile flag,
+  `-DSWEET_BOARD_PI5=1 -mcpu=cortex-a76`, added to `MACHINE_FLAGS_ARM64_SWEET`
+  by a new workflow input `board: sweet | pi5`.
+- Pi 5 changes go in new patches numbered from 0101 (clear of upstream's
+  0001-0077 series) and are gated `#if SWEET_BOARD_PI5`. Phone code keeps
+  building as before when the flag is off.
+- Needed in 0101+: SWEET.h board block without `HAS_GIC_V3` (VTIMER INTID 27,
+  MAX_CPUS 4); GICv2 init in `pe_init_fiq` (GICD/GICC MMIO from the ADT);
+  `sleh_irq` acking via GICC_IAR/EOIR MMIO; IPIs via GICD_SGIR with the target's
+  GIC CPU-interface mask (read from banked GICD_ITARGETSR0 on each core);
+  cpu number from MPIDR Aff1; drop the sweet drivers (UFS, SPMI, RPMh, keys,
+  touch, battery, USB) from the PI5 build; framebuffer from the ADT.
+- Writing patch hunks needs the patched xnu tree (xnu-8796.141.3 + blacktop's
+  darwin-xnu-build patches + 0001-0081) locally, or the CI `xnu-buildtree`
+  artifact from a fork.
+
+### Stage 2 status (2026-11-07)
+
+Done, not yet compiled (needs the macOS CI build):
+- `xnu/patches/0101-pi5-board-gicv2.patch` (10 files, +226/-14), applies on
+  the local tree = xnu-8796.141.3 + dxb seds + all patches as CI applies them
+  (83 applied; skipped as expected: 0031/0041 need the staged HFS sources,
+  blacktop's 4 version-specific patches). Contents:
+  - `SWEET.h`: `SWEET_BOARD_PI5` (default 0), `SWEET_GICV2`, 4 CPUs,
+    `VMAPPLE_UART` (PL011 driver), vtimer INTID 27, GICv2 register offsets,
+    early framebuffer as constants (`SWEET_EARLY_FB_*`, block base + offset).
+  - `pe_fiq.c`: GICv2 `pe_init_fiq` (GICD/GICC from ADT, banked
+    ITARGETSR0 -> per-CPU interface mask, priorities 0xA0, PMR 0xF0),
+    `sweet_gic_ack/eoi/send_sgi`.
+  - `sleh.c`: IRQ ack/EOI through GICC MMIO on Pi 5. `SweetCPU.cpp`: IPIs via
+    GICD_SGIR. `start.s`: no ICC_SRE_EL2 write on Pi 5 (UNDEFINED without GIC
+    sysregs; secondaries enter at EL2), framebuffer constants.
+  - `arm_vm_init.c`, `sweet_early.c`: framebuffer constants.
+  - `pe_serial.c`: PL011 keeps the firmware's 115200 divisor on Pi 5.
+  - `KernelConfigTables.cpp`: SweetPlatformExpert also matches
+    `raspberrypi,5-model-b`, SweetCPU also `arm,cortex-a76`.
+  - Phone drivers (UFS, SPMI keys, touch, USB) only start with
+    `rd=ufsroot0`, so they stay off on Pi 5 with a RAM-disk root.
+- `.github/workflows/xnu.yml`: input `board` (sweet | pi5). pi5 appends
+  `-DSWEET_BOARD_PI5=1` to the SWEET MACHINE_FLAGS line inside 0004 (checked
+  locally: the edited 0004 still applies). MACHINE_FLAGS feed both CFLAGS and
+  SFLAGS, so assembly sees the define too.
+- `tools/mkadt_pi5.py [--qemu]`: ADT with the measured Pi 5 values (RAM
+  0x40000000 + 3 GB, arm-io at 0x10_0000_0000, GIC-400, uart0, 4 cpus with
+  reg 0x000-0x300, sweet-fbcon 0x3f400000 1920x1080, provisional iPad7,5 /
+  J71bAP identity). `--qemu`: QEMU virt GICv2/PL011 addresses, kernel RAM at
+  4 GB (QEMU loads shim + initrd at 0x40000000).
+- `shim-pi5/loader.c`: boots a SWEETXNU payload from the initramfs (Pi:
+  `initramfs payload.bin followkernel`; QEMU: `-initrd`). Verified in QEMU with
+  a fake 1-segment payload: copied to 0x100000000, entered at EL1 with
+  boot_args Revision 2 in x0 (printed "K2").
+
+Known risks to check on the first real boot:
+- The early-console framebuffer is mapped as a 32 MB block 0x3e000000-0x40000000,
+  which also covers RAM 0x3e000000-0x3f400000 (write-combine alias). Nothing
+  of ours lives there; the firmware's DTB is at 0x2e03a500.
+- In QEMU virt that block is PCIe ECAM space; early-console writes go nowhere.
+- Untested assumption: GIC-400 CPU interface n = core n (fallback when a CPU
+  has not stored its ITARGETSR mask yet).
+
+Next: GitHub fork + `gh workflow run xnu.yml -f board=pi5`, then
+`mkpayload.py KERNEL out-pi5/pi5-qemu.adt payload.bin --cmdline "debug=0x8 serial=3 cpus=1 -v"`
+and `shim-pi5/qemu.sh 60 payload.bin`.
+
+## Pi 5 hardware facts (measured by the stage 1 shim, 2026-11-07)
+
+- CPU: MIDR 0x414fd0b1 (Cortex-A76 r4p1). MPIDR cpu0 0x81000000, cpu1-3
+  0x81000100/200/300: **MT=1, core number in Aff1, Aff0 = 0**. XNU's cpu/cluster
+  numbering assumes Apple's layout (Aff0 = core, Aff1 = cluster), so the ADT
+  cpu nodes and `ml_get_cpu_number`-style code must map Aff1 to the cpu number.
+- MMFR0 0x101122 (16K + 4K granule, 40-bit PA), PFR0 0x1100000010111112 (GIC
+  sysregs field = 0), ISAR1 0x100001 (no PAC).
+- Entry: firmware enters at EL2; PSCI CPU_ON also starts secondaries at EL2.
+  PSCI 1.1 over `smc`, SMCCC 1.2 (0x10002). CPU_ON returns 0 for all three.
+- Timer: CNTFRQ 54 MHz. PPIs phys 14, virt 11, hyp 10 (INTID 30 / 27 / 26).
+  vtimer INTID 27 = 29 IRQs per 300 ms at EL1.
+- GIC-400: GICD 0x107fff9000, GICC 0x107fffa000. GICD_TYPER 0xfc69
+  (ITLinesNumber 9 = 320 INTIDs, 4 CPU interfaces, SecurityExtn 1),
+  GICD_IIDR 0x0200143b, GICC_IIDR 0x0202143b. Non-secure Group 1 works
+  with GICD_CTLR bit 0 + GICC_CTLR bit 0, PMR 0xf0, priority 0xa0.
+- RAM (8180 MiB): 0x0-0x3f400000, 0x40000000-0x100000000,
+  0x100000000-0x200000000. Gap 0x3f400000-0x40000000 = firmware/framebuffer.
+- Framebuffer: 0x3f400000, 1920x1080, stride 7680, a8r8g8b8 (16K aligned).
+- Debug UART: PL011 at 0x107d001000 (from DT stdout-path).
+- DTB loaded at 0x2e03a500 by the firmware. Addresses below come from the
+upstream `bcm2712.dtsi` and have to be checked against the live DT the Pi
+firmware hands over (the shim already parses the DT in `shim/fdt.c`).
+
+## What carries over and what does not
+
+| Area | ios-sweet code | On Pi 5 |
+|---|---|---|
+| Build: plain arm64 (no PAC), 16K pages, MASTER config | 0001-0009, `config/MASTER.arm64.sweet` | **Keep.** Cortex-A76 supports the 16K granule and has no PAC, same as Kryo 470. Rename board to `PI5`. |
+| Crypto, PRNG, pthread, HFS+, AMFI, entitlements, keystore, sandbox | 0013-0015, 0019-0027, 0032-0038, 0050 | **Keep as is.** SoC-neutral. |
+| IOSurface, IOMobileFramebuffer, HID event services, watchdog, crash/log tooling | 0040-0058, 0064, 0066-0068 | **Keep.** Framebuffer needs base/size/stride from DT instead of the sweet panel. |
+| Device identity | 0059 (iPhone X `D22AP`), 0061 (1125x2436) | **Replace** with an iPad identity and a landscape HDMI-friendly size. |
+| Interrupt controller | GICv3 via system registers (0004, 0017, 0018, 0065) | **Rewrite.** BCM2712 has a **GIC-400 (GICv2)**: memory-mapped CPU interface (GICC), no ICC_* sysregs, no redistributors. Biggest kernel change. |
+| SMP / PSCI | PSCI via `smc` (0065) | **Keep.** Pi 5 runs TF-A BL31, PSCI over `smc`. |
+| Timer | arch timer, vtimer PPI from ADT (0017) | **Keep.** PPI number from DT. |
+| Boot entry | shim booted by `fastboot boot`, enters at EL1 | **Change.** Pi firmware loads `kernel_2712.img` and enters at **EL2**: shim must set HCR_EL2/CNTHCTL_EL2 and `eret` to EL1. |
+| Console | framebuffer + sweet serial | Debug UART on the 3-pin JST header (PL011 `uart10`, ~0x10_7d001000). Needs a USB-UART probe. |
+| Storage | `sweet_ufs.c`, `shim/ufs.c` (Qualcomm UFS) | **Replace** with SD card (BCM2712 SDHCI, on the SoC, not RP1). Root = HFS+ partition on the SD card. NVMe later. |
+| Keys, touch, PMIC, battery | `sweet_spmi.c`, `sweet_rpmh.c`, `sweet_keys.c`, `sweet_touch.c`, `SweetBattery.cpp` | **Drop.** Fake "on AC power". |
+| USB | `sweet_usb.c` (gadget, CDC-ECM) | **Replace.** Pi 5 USB-A ports sit on **RP1 behind PCIe**: need brcmstb PCIe root complex, RP1, then xHCI host (DWC3 in host mode), then USB HID boot protocol into `SweetHID`. Second-biggest piece. |
+| GPU | none (CPU rendering, `SWContext`) | **Same.** CPU rendering on 4x A76 should be faster than on the phone's A55s. |
+
+## Which iPadOS
+
+The userland must be plain arm64 (no arm64e), so it has to come from an A10/A11-era
+iPad on iOS 16: **iPad (6th generation), iPad7,5 / iPad7,6, iPadOS 16.7.x**.
+Same steps as `tools/mkiosroot.sh` for the iPhone X IPSW. You download the IPSW from
+Apple yourself; nothing Apple-made goes in git (same rule as upstream). Apple's
+license only allows running iPadOS on Apple hardware, so this stays a personal
+experiment.
+
+Display: present 2048x1536 (native 6th-gen size, 4:3) and letterbox on HDMI, or
+present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
+
+## Stages (each ends in something you can see)
+
+1. **Shim on the Pi.** `config.txt` loads the shim as `kernel_2712.img`. EL2 to EL1
+   drop, PL011 UART output, read DT: memory, GIC, UART, simple-framebuffer.
+   Done when: "PI5 SHIM" on the UART and a coloured screen on HDMI.
+2. **Kernel to `ml_wait_max_cpus`.** New board config, GICv2 driver
+   (`Pi5GIC`: GICD + GICC, IAR/EOIR in MMIO, timer PPI as IRQ), ADT from
+   `tools/mkadt.py --pi5`. Ramdisk root first, as sweet did in 0021.
+   Can be tested in QEMU first (`-M virt,gic-version=2 -cpu cortex-a76`).
+   Done when: XNU banner on UART, 4 CPUs up through PSCI.
+3. **Root from SD.** SDHCI driver replacing `sweet_ufs.c`, HFS+ root on SD.
+   Done when: launchd starts from the SD card.
+4. **SpringBoard on HDMI.** iPad identity, framebuffer from DT.
+   Done when: iPad home screen on the monitor (4-minute boot is fine).
+5. **Keyboard and mouse.** PCIe link to RP1, xHCI host, HID boot protocol,
+   feed `SweetHID`. Done when: typing in Notes and a pointer on screen.
+6. **Later:** Ethernet (RP1 Cadence GEM), NVMe root, audio over HDMI.
+
+## What is needed
+
+- Raspberry Pi 5 8 GB, SD card (32 GB+), USB-to-UART probe for the debug header
+  (the official Raspberry Pi Debug Probe fits it), HDMI monitor, USB keyboard + mouse.
+- A GitHub fork for the macOS CI kernel build (`.github/workflows/xnu.yml`).
+- Linux (WSL2 is fine) for the shim cross-compile and building the root image.

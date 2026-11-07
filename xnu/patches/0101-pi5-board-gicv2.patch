@@ -1,0 +1,439 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..0bfa24a 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,9 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if SWEET_GICV2
++extern "C" void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -214,6 +217,11 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("SWEET CPU: invalid SGI target %u", logical);
+ 	}
++#if SWEET_GICV2
++	/* Pi 5 GIC-400: GICD_SGIR with the target's CPU-interface mask (pe_fiq.c). */
++	sweet_gic_send_sgi(logical, SWEET_IPI_SGI);
++	return;
++#endif
+ 	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+ 	uint64_t mpidr = topology->cpus[logical].phys_id;
+ 	unsigned int aff0 = mpidr & 0xff;
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..dd26cb2 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,13 +38,13 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-    "     'IONameMatch'     = 'xiaomi,sweet';"
++    "     'IONameMatch'     = ('xiaomi,sweet', 'raspberrypi,5-model-b');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = ('qcom,kryo470', 'arm,cortex-a76');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..00f3d22 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,7 +1843,7 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = (uint64_t)SWEET_EARLY_FB_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+@@ -2190,7 +2190,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if defined(SWEET)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++	sweet_early_relocate(SWEET_EARLY_FB_VA + SWEET_EARLY_FB_BLOCK_OFF);
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..ec9b26d 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1861,8 +1861,16 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++#if SWEET_GICV2
++	/* Pi 5 GIC-400: memory-mapped CPU interface (pe_fiq.c). */
++#define SWEET_GIC_EOI(v) sweet_gic_eoi((uint32_t)(v))
++	uint64_t iar = sweet_gic_ack();
++	uint32_t intid = (uint32_t)(iar & GICC_IAR_INTID_MASK);
++#else
++#define SWEET_GIC_EOI(v) __builtin_arm_wsr64("ICC_EOIR1_EL1", (v))
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++#endif
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -1873,11 +1881,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1888,9 +1896,10 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
++#undef SWEET_GIC_EOI
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..c2d3157 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,13 @@ LEXT(sweet_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
++#if !SWEET_GICV2
+ 	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++#endif /* Pi 5 GIC-400 has no ICC_* sysregs: ICC_SRE_EL2 is UNDEFINED there */
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+@@ -515,10 +517,10 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_EARLY_FB_PA + (SWEET_EARLY_FB_H - 32) * SWEET_EARLY_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #SWEET_EARLY_FB_STRIDE
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -686,7 +688,7 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, SWEET_EARLY_FB_BLOCK_PA
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..1af95d8 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,11 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PA;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH ((unsigned int)SWEET_EARLY_FB_W)
++#define EARLY_HEIGHT ((unsigned int)SWEET_EARLY_FB_H)
++#define EARLY_STRIDE ((unsigned int)SWEET_EARLY_FB_STRIDE / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..553845d 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,130 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#elif SWEET_GICV2
++/*
++ * Raspberry Pi 5 GIC-400 (GICv2). No ICC_* system registers: the CPU
++ * interface (GICC) is memory mapped. TF-A runs the GIC with security
++ * extensions, so from EL1 non-secure everything we can see is Group 1 and
++ * arrives as an IRQ (sleh_irq). Sequence verified on hardware by shim-pi5:
++ * GICD_CTLR bit 0, priority 0xA0, GICC_PMR 0xF0, GICC_CTLR bit 0.
++ *
++ * ADT /arm-io/gic "reg" = <GICD base, GICD size, GICC base, GICC size>,
++ * arm-io relative, same shape as the GICv3 node (GICR replaced by GICC).
++ */
++SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++
++static vm_offset_t gicd_base;
++static vm_offset_t gicc_base;
++/* GIC CPU-interface target mask of each logical CPU, for GICD_SGIR. */
++static uint8_t gic_cpu_mask[SWEET_SMP_MAX_CPUS];
++
++static inline uint32_t
++gic_read32(vm_offset_t addr)
++{
++	return *((volatile uint32_t *) addr);
++}
++
++static inline void
++gic_write32(vm_offset_t addr, uint32_t value)
++{
++	*((volatile uint32_t *) addr) = value;
++}
++
++void
++pe_init_fiq()
++{
++	int error;
++	DTEntry entry;
++
++	if (!gicd_base) {
++		error = SecureDTLookupEntry(NULL, "/arm-io/gic", &entry);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++		void const *prop;
++		unsigned int prop_size;
++		error = SecureDTGetProperty(entry, "reg", &prop, &prop_size);
++		if (error != kSuccess || prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: GIC reg must be <GICD size GICC size>, got %u bytes", __func__,
++			    error == kSuccess ? prop_size : 0);
++		}
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess &&
++		    timer_size == sizeof(uint32_t)) {
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			sweet_vtimer_intid = intid;
++		}
++
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++		uint64_t const *reg = (uint64_t const *)prop;
++		gicd_base = ml_io_map(soc_base_phys + reg[0], reg[1]);
++		gicc_base = ml_io_map(soc_base_phys + reg[2], reg[3]);
++		if (!gicd_base || !gicc_base) {
++			panic("%s: cannot map GICD/GICC", __func__);
++		}
++		kprintf("SWEET GIC: GICv2 GICD 0x%llx GICC 0x%llx, virtual timer INTID %u\n",
++		    (uint64_t)(soc_base_phys + reg[0]), (uint64_t)(soc_base_phys + reg[2]),
++		    sweet_vtimer_intid);
++
++		/* Distributor: non-secure view, bit 0 = EnableGrp1. */
++		gic_write32(gicd_base + GICD_CTLR_V2, gic_read32(gicd_base + GICD_CTLR_V2) | 1);
++	}
++
++	/*
++	 * Per CPU. GICD_ITARGETSR0-7 are banked: byte 0 reads back this CPU's
++	 * own interface mask, which GICD_SGIR needs to reach it.
++	 */
++	unsigned int cpu = ml_get_cpu_number_local();
++	uint8_t mask = (uint8_t)(gic_read32(gicd_base + GICD_ITARGETSR) & 0xff);
++	if (cpu < SWEET_SMP_MAX_CPUS) {
++		gic_cpu_mask[cpu] = mask;
++	}
++
++	/* SGIs and PPIs (banked): priority, then enable timer and IPI SGI. */
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gic_write32(gicd_base + GICD_IPRIORITYR + i, 0xA0A0A0A0);
++	}
++	gic_write32(gicd_base + GICD_ISENABLER, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	/* CPU interface: accept priority < 0xF0, no preemption grouping, EOImode 0. */
++	gic_write32(gicc_base + GICC_PMR, 0xF0);
++	gic_write32(gicc_base + GICC_BPR, 0);
++	gic_write32(gicc_base + GICC_CTLR, 1);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++	kprintf("SWEET GIC: cpu %u interface mask 0x%x\n", cpu, mask);
++}
++
++uint32_t
++sweet_gic_ack(void)
++{
++	return gic_read32(gicc_base + GICC_IAR);
++}
++
++void
++sweet_gic_eoi(uint32_t iar)
++{
++	gic_write32(gicc_base + GICC_EOIR, iar);
++}
++
++void
++sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi)
++{
++	uint8_t mask = cpu < SWEET_SMP_MAX_CPUS ? gic_cpu_mask[cpu] : 0;
++	if (mask == 0) {
++		/* Target has not run pe_init_fiq yet: GIC-400 interface n = core n on BCM2712. */
++		mask = (uint8_t)(1U << cpu);
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	/* TargetListFilter 0 (use the list), CPUTargetList [23:16], SGIINTID [3:0]. */
++	gic_write32(gicd_base + GICD_SGIR, ((uint32_t)mask << 16) | (sgi & 0xF));
++	__builtin_arm_isb(ISB_SY);
++}
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..a63c47a 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -657,8 +657,11 @@ vmapple_uart_init(void)
+ 		PL011_LCR_PARITY_DISABLE |
+ 		PL011_LCR_BREAK_DISABLE
+ 		);
++#if !SWEET_BOARD_PI5
++	/* Pi 5: keep the firmware's 115200 divisor (enable_uart=1, 44.2368 MHz clock). */
+ 	VMAPPLE_UART0_IBRD = PL011_IBRD_DIV_38400;
+ 	VMAPPLE_UART0_FBRD = PL011_FBRD_DIV_38400;
++#endif
+ 	VMAPPLE_UART0_TIMSC = 0x0;
+ 	VMAPPLE_UART0_ICR = PL011_ICR_CLR_ALL_IRQS;
+ 	VMAPPLE_UART0_CR = (
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..9356730 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,12 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++#if SWEET_BOARD_PI5
++/* GICv2 (pe_fiq.c): memory-mapped CPU interface instead of ICC_* sysregs. */
++uint32_t sweet_gic_ack(void);
++void sweet_gic_eoi(uint32_t iar);
++void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++#endif
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..917bbdd 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -17,6 +17,23 @@
+ 
+ #define SWEET                     1
+ 
++/* Board variant: -DSWEET_BOARD_PI5=1 from MACHINE_FLAGS_ARM64_SWEET (CI input board=pi5). */
++#ifndef SWEET_BOARD_PI5
++#define SWEET_BOARD_PI5           0
++#endif
++
++#if SWEET_BOARD_PI5
++/*
++ * Raspberry Pi 5 (BCM2712), built from the same SWEET config with
++ * -DSWEET_BOARD_PI5=1: 4x Cortex-A76 r4p1 (MPIDR 0x81000n00: MT=1, core in
++ * Aff1), GIC-400 = GICv2 with a memory-mapped CPU interface and no ICC_*
++ * system registers, PL011 debug UART, PSCI 1.1 over smc. Values measured
++ * by shim-pi5 stage 1 on real hardware (PI5-PORT.md).
++ */
++#define SWEET_SMP_MAX_CPUS         4
++#define SWEET_GICV2                1
++#define VMAPPLE_UART                      /* XNU's PL011 driver */
++#else
+ /*
+  * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+  * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+@@ -24,6 +41,28 @@
+  * clusters yet).
+  */
+ #define SWEET_SMP_MAX_CPUS         8
++#define SWEET_GICV2                0
++#endif
++
++/*
++ * Boot splash framebuffer for the early console (start.s, arm_vm_init.c,
++ * sweet_early.c). It is mapped as one 32MB L2 block (16K pages), so the
++ * block base and the framebuffer's offset inside it are given separately.
++ */
++#if SWEET_BOARD_PI5
++#define SWEET_EARLY_FB_BLOCK_PA   0x3e000000      /* fb 0x3f400000, 1920x1080 */
++#define SWEET_EARLY_FB_BLOCK_OFF  0x01400000
++#define SWEET_EARLY_FB_W          1920
++#define SWEET_EARLY_FB_H          1080
++#define SWEET_EARLY_FB_STRIDE     7680
++#else
++#define SWEET_EARLY_FB_BLOCK_PA   0x9c000000      /* ABL cont_splash_region */
++#define SWEET_EARLY_FB_BLOCK_OFF  0x0
++#define SWEET_EARLY_FB_W          1080
++#define SWEET_EARLY_FB_H          2400
++#define SWEET_EARLY_FB_STRIDE     4320
++#endif
++#define SWEET_EARLY_FB_PA         (SWEET_EARLY_FB_BLOCK_PA + SWEET_EARLY_FB_BLOCK_OFF)
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+@@ -36,7 +75,9 @@
+ #define __ARM_PAN_AVAILABLE__     1
+ #define __ARM_16K_PG__            1
+ 
++#if !SWEET_GICV2
+ #define HAS_GIC_V3                1
++#endif
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+@@ -47,9 +88,28 @@
+  * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
++#if SWEET_BOARD_PI5
++#define SWEET_VTIMER_INTID        27      // standard PPI 11; the ADT can override
++#else
+ #define SWEET_VTIMER_INTID        19
++#endif
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
++#if SWEET_GICV2
++/* GICv2 / GIC-400 (Arm IHI 0048B), non-secure view: everything is Group 1. */
++#define GICD_CTLR_V2              0x000
++#define GICD_ISENABLER            0x100
++#define GICD_IPRIORITYR           0x400
++#define GICD_ITARGETSR            0x800
++#define GICD_SGIR                 0xF00
++#define GICC_CTLR                 0x00
++#define GICC_PMR                  0x04
++#define GICC_BPR                  0x08
++#define GICC_IAR                  0x0C
++#define GICC_EOIR                 0x10
++#define GICC_IAR_INTID_MASK       0x3FF
++#endif
++
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+ 
+ #define GICR_PE_SIZE              0x20000 // Size of each redistributor region

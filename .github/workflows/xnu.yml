@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      board:
+        description: sweet (Redmi Note 10 Pro) or pi5 (Raspberry Pi 5, adds -DSWEET_BOARD_PI5=1)
+        default: sweet
   push:
     branches: [main]
     paths:
@@ -31,6 +34,7 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  BOARD: ${{ inputs.board || 'sweet' }}
 
 jobs:
   build:
@@ -51,6 +55,15 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # Raspberry Pi 5: same SWEET machine config plus one define (0101+ patches,
+          # PI5-PORT.md). Edits the added MACHINE_FLAGS line inside 0004, so the
+          # patch keeps applying; fails loudly if that line ever changes.
+          if [ "$BOARD" = pi5 ]; then
+            sed -i '' 's/^\(+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET.*\)$/\1 -DSWEET_BOARD_PI5=1/' dxb/patches/0004-sweet-machine-config.patch
+            grep -c 'SWEET_BOARD_PI5=1' dxb/patches/0004-sweet-machine-config.patch
+          elif [ "$BOARD" != sweet ]; then
+            echo "unknown board $BOARD" >&2; exit 1
+          fi
           ls dxb/patches
 
       - name: Deps

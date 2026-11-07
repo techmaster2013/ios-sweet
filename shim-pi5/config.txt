@@ -1,0 +1,13 @@
+# ios-pi5 stage 1: append to the END of config.txt on a Raspberry Pi OS boot
+# partition (keep a copy of the original). Delete these lines to boot Linux again.
+[all]
+kernel=ios-pi5-shim.img
+arm_64bit=1
+os_check=0
+# Debug UART on the 3-pin JST header, 115200 8N1, firmware logs there too
+enable_uart=1
+uart_2ndstage=1
+# Firmware framebuffer (simple-framebuffer in the DT), 32 bpp
+framebuffer_depth=32
+disable_overscan=1
+# If HDMI stays black: comment out "dtoverlay=vc4-kms-v3d" higher up
