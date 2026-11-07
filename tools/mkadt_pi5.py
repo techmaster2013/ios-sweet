@@ -162,7 +162,7 @@ def build(qemu=False, seed=None):
         extra.append(node('sweet-sd', [
             ph(),
             ('compatible', cstr('brcm,bcm2712-sdhci')),
-            ('reg', u64(0x107cfff000, 0x100, 0x107cfff400, 0x100)),
+            ('reg', u64(0x107cfff000, 0x260, 0x107cfff400, 0x200)),
         ]))
 
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])

@@ -328,6 +328,21 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   strategy with partition bounds checks, devfs nodes, root via rd=), with
   SDHCI PIO transfers first (DMA later).
 
+### SD root driver (bsd/dev/sweet_sd.c, 2026-11-07)
+
+- ADT `/sweet-sd`, reg = <0x107cfff000 0x260 0x107cfff400 0x200> (Pi only).
+- Boot with `rd=sdroot0`. Boot-args: `sdpart=N` (pick MBR entry N instead
+  of the first 0xAF), `sdrw=1` (allow writes, bounds-checked to the
+  partition), `sdclk=` (Hz, capped at 25 MHz), `sdbase=` (override the
+  SDHCI base clock if the caps field is wrong).
+- Init: dump host registers, force card detect (brcmstb cfg CD test bits,
+  then SDHCI host-control test bits) if not present, reset CMD/DAT only (not
+  ALL, which would drop the 1.8 V bit), UHS mode -> SDR12, 400 kHz, CMD0,
+  CMD8, ACMD41, CMD2/3/9/7, ACMD6 4-bit, CMD16, 25 MHz. Then MBR scan and
+  the HFS+ signature at partition byte 1024, all printed as `SWEET SD:`.
+- Polled PIO, CMD17/18 (auto CMD12) and CMD24/25, max 2048 blocks a command.
+  At 25 MHz 4-bit that is ~12 MB/s at best; high speed / DMA come later.
+
 ## Stage 3 build environment (WSL2, 2026-11-07)
 
 - IPSW iPadOS 16.6.1 (20G81) in the user's Downloads (5727423701 bytes, size
