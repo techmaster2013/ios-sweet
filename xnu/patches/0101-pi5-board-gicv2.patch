@@ -70,42 +70,60 @@ index 92f3e26..dd26cb2 100644
      "   },"
      "   {"
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 42362c5..2c41b8e 100644
+index 42362c5..895c357 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -347,6 +347,13 @@ arm_init(
+@@ -347,6 +347,12 @@ arm_init(
  	DTEntry chosen = NULL;
  	unsigned int dt_entry_size = 0;
  
 +#if SWEET_BOARD_PI5
-+	/* Same rule as start.s stage 0: no early framebuffer console unless the
-+	 * shim reported the firmware framebuffer at the expected address. */
-+	if (args->Video.v_baseAddr != (unsigned long)SWEET_EARLY_FB_PA) {
-+		sweet_early_disable();
-+	}
++	/* Early framebuffer console on whatever the shim reported (start.s stage 0
++	 * used the same boot_args->Video values); none = console off (QEMU). */
++	sweet_early_set_fb(args->Video.v_baseAddr, args->Video.v_width, args->Video.v_height,
++	    args->Video.v_rowBytes, args->Video.v_depth);
 +#endif
  	sweet_early_mark(1, "arm_init entered (MMU on)");
  
  	arm_setup_pre_sign();
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 06bb568..00f3d22 100644
+index 06bb568..2bd5597 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1843,7 +1843,7 @@ sweet_early_map_final(void)
+@@ -1837,13 +1837,22 @@ static void
+ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++#if SWEET_BOARD_PI5
++	/* Runtime framebuffer from boot_args (sweet_early_set_fb); 0 = console off. */
++	const uint64_t block_pa = sweet_early_fb_pa() & ~(uint64_t)ARM_TT_L2_OFFMASK;
++	if (sweet_early_fb_pa() == 0) {
++		return;
++	}
++#else
++	const uint64_t block_pa = SWEET_EARLY_FB_BLOCK_PA;
++#endif
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
  	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
  	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
  	assert(*slot == ARM_TTE_EMPTY);
 -	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
-+	*slot = (uint64_t)SWEET_EARLY_FB_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = block_pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
  	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
  	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
  	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
-@@ -2190,7 +2190,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2190,7 +2199,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  
  #if defined(SWEET)
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
 -	sweet_early_relocate(SWEET_EARLY_FB_VA);
++#if SWEET_BOARD_PI5
++	sweet_early_relocate(SWEET_EARLY_FB_VA + (sweet_early_fb_pa() & ARM_TT_L2_OFFMASK));
++#else
 +	sweet_early_relocate(SWEET_EARLY_FB_VA + SWEET_EARLY_FB_BLOCK_OFF);
++#endif
  #endif
  	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
  
@@ -157,7 +175,7 @@ index 24f1abc..ec9b26d 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 023086f..4ba78aa 100644
+index 023086f..54e5b63 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -306,11 +306,13 @@ LEXT(sweet_secondary_entry)
@@ -174,33 +192,34 @@ index 023086f..4ba78aa 100644
  	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
  	MOV64	x1, 0x30d00800
  	msr		SCTLR_EL1, x1
-@@ -514,11 +516,23 @@ LEXT(start_first_cpu)
- 	mov		x21, #0
+@@ -515,10 +517,24 @@ LEXT(start_first_cpu)
  
  #if defined(SWEET)
-+#if SWEET_BOARD_PI5
-+	/*
-+	 * Pi 5: draw only if the shim found the firmware framebuffer exactly
-+	 * where the early console expects it (boot_args->Video.v_baseAddr).
-+	 * QEMU (no framebuffer: 0) or another HDMI mode would otherwise have
-+	 * us write into PCIe ECAM or RAM.
-+	 */
-+	ldr		x0, [x20, #40]
-+	MOV64	x1, SWEET_EARLY_FB_PA
-+	cmp		x0, x1
-+	b.ne	Lsweet_mark_done
-+#endif
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
 -	MOV64	x0, (0x9c000000 + 2368 * 4320)
++#if SWEET_BOARD_PI5
++	/*
++	 * Pi 5: the framebuffer the shim reports in boot_args->Video (base 40,
++	 * rowBytes 56, height 72); none (QEMU without one) = no early console.
++	 * The firmware places and sizes it per HDMI mode, so no constants.
++	 */
++	ldr		x0, [x20, #40]
++	cbz		x0, Lsweet_mark_done
++	ldr		x4, [x20, #56]
++	ldr		x2, [x20, #72]
++	sub		x2, x2, #32
++	madd	x0, x2, x4, x0
++#else
 +	MOV64	x0, (SWEET_EARLY_FB_PA + (SWEET_EARLY_FB_H - 32) * SWEET_EARLY_FB_STRIDE)
++	mov		x4, #SWEET_EARLY_FB_STRIDE
++#endif
  	mov		w1, #-1
  	mov		x2, #32
 -	mov		x4, #4320
-+	mov		x4, #SWEET_EARLY_FB_STRIDE
  Lsweet_mark_row:
  	mov		x3, #64
  	mov		x5, x0
-@@ -530,6 +544,7 @@ Lsweet_mark_pixel:
+@@ -530,6 +546,7 @@ Lsweet_mark_pixel:
  	subs	x2, x2, #1
  	b.ne	Lsweet_mark_row
  	dsb		sy
@@ -208,35 +227,112 @@ index 023086f..4ba78aa 100644
  #endif
  
  	// Set low reset vector before attempting any loads
-@@ -686,7 +701,7 @@ Lkernelcache_base_found:
+@@ -686,13 +703,23 @@ Lkernelcache_base_found:
  	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
  	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
  	 */
 -	MOV64	x10, 0x9c000000
++#if SWEET_BOARD_PI5
++	/* Block containing boot_args->Video.v_baseAddr; none = no mapping. */
++	ldr		x10, [x20, #40]
++	cbz		x10, Lsweet_fbmap_done
++	bic		x10, x10, #(ARM_TT_L2_OFFMASK)
++#else
 +	MOV64	x10, SWEET_EARLY_FB_BLOCK_PA
++#endif
  	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
  	orr		x11, x11, x10
  	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#if SWEET_BOARD_PI5
++Lsweet_fbmap_done:
++#endif
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
-index 6928957..1af95d8 100644
+index 6928957..bbf723d 100644
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
-@@ -11,11 +11,11 @@
+@@ -10,12 +10,24 @@
+ #if defined(SWEET)
  #include <stdint.h>
  #include <kern/misc_protos.h>
++#include <arm64/proc_reg.h>
  
 -static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
-+static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PA;
++#if SWEET_BOARD_PI5
++/* Pi 5: whatever framebuffer the shim reported (sweet_early_set_fb). */
++static volatile uint32_t *early_fb;
++static uint64_t early_fb_pa;
++static unsigned int early_w, early_h, early_stride_px;
  #define EARLY_FB early_fb
 -#define EARLY_WIDTH 1080u
 -#define EARLY_HEIGHT 2400u
 -#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH early_w
++#define EARLY_HEIGHT early_h
++#define EARLY_STRIDE early_stride_px
++#else
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PA;
++#define EARLY_FB early_fb
 +#define EARLY_WIDTH ((unsigned int)SWEET_EARLY_FB_W)
 +#define EARLY_HEIGHT ((unsigned int)SWEET_EARLY_FB_H)
 +#define EARLY_STRIDE ((unsigned int)SWEET_EARLY_FB_STRIDE / 4)
++#endif
  #define EARLY_SCALE 2u
  #define EARLY_CELL_W (8u * EARLY_SCALE)
  #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -140,4 +152,32 @@ sweet_early_disable(void)
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
++
++#if SWEET_BOARD_PI5
++/*
++ * arm_init, before the first mark: the framebuffer from boot_args->Video.
++ * start.s already drew stage 0 and mapped its 32MB block VA=PA from the
++ * same values. Anything unusable (QEMU: base 0) turns the console off.
++ */
++void
++sweet_early_set_fb(uint64_t base, uint64_t width, uint64_t height, uint64_t row_bytes, uint64_t depth)
++{
++	if (base == 0 || depth != 32 || width < 64 || height < 64 || row_bytes < width * 4 ||
++	    (base & ARM_TT_L2_OFFMASK) + row_bytes * height > ARM_TT_L2_SIZE) {
++		sweet_early_disable();
++		return;
++	}
++	early_fb_pa = base;
++	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_w = (unsigned int)width;
++	early_h = (unsigned int)height;
++	early_stride_px = (unsigned int)(row_bytes / 4);
++}
++
++uint64_t
++sweet_early_fb_pa(void)
++{
++	return early_disabled ? 0 : early_fb_pa;
++}
++#endif
+ #endif /* SWEET */
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..8f1a404 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,6 +12,10 @@ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++#if SWEET_BOARD_PI5
++void sweet_early_set_fb(uint64_t base, uint64_t width, uint64_t height, uint64_t row_bytes, uint64_t depth);
++uint64_t sweet_early_fb_pa(void);       /* 0 = early console off */
++#endif
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 6089db9..553845d 100644
 --- a/pexpert/arm/pe_fiq.c

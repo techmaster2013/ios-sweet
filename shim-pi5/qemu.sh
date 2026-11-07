@@ -1,16 +1,43 @@
 #!/bin/bash
-# Smoke-test the stage 1 shim in QEMU with a Pi 5-like setup: 4x Cortex-A76,
-# 8 GB, GICv2, entry at EL2 (virtualization=on), PSCI over smc.
-# No framebuffer in QEMU virt: output is the PL011 on stdout.
-set -euo pipefail
-cd "$(dirname "$0")"
-# Usage: qemu.sh [SECONDS] [PAYLOAD]
+# Smoke-test the shim in QEMU with a Pi 5-like setup: 4x Cortex-A76, 8 GB,
+# GICv2, entry at EL2 (virtualization=on), PSCI over smc. Output is the PL011
+# on stdout. QEMU virt has no framebuffer: the shim reports a fake 1920x1080
+# one at 0x7e000000 (guest RAM) so xnu's early console runs as on a Pi.
+#
+# Usage: [FBDUMP=out.png] qemu.sh [SECONDS] [PAYLOAD]
 #   no payload: stage 1 checks
 #   PAYLOAD (tools/mkpayload.py with an ADT from tools/mkadt_pi5.py --qemu): boots xnu
+#   FBDUMP: save the fake framebuffer as a PNG just before QEMU is stopped
+set -euo pipefail
+cd "$(dirname "$0")"
 secs=${1:-6}
 payload=${2:-}
-timeout --foreground "$secs" qemu-system-aarch64 \
-	-M virt,gic-version=2,virtualization=on,secure=off \
-	-cpu cortex-a76 -smp 4 -m 8G \
-	-nographic -no-reboot -nic none \
-	-kernel out/ios-pi5-shim.img ${payload:+-initrd "$payload"} || true
+args=(-M virt,gic-version=2,virtualization=on,secure=off
+	-cpu cortex-a76 -smp 4 -m 8G
+	-nographic -no-reboot -nic none
+	-kernel out/ios-pi5-shim.img)
+[ -n "$payload" ] && args+=(-initrd "$payload")
+
+if [ -z "${FBDUMP:-}" ]; then
+	timeout --foreground "$secs" qemu-system-aarch64 "${args[@]}" || true
+	exit 0
+fi
+
+sock=$(mktemp -u /tmp/qemu-mon.XXXXXX)
+raw=$(mktemp /tmp/qemu-fb.XXXXXX)
+qemu-system-aarch64 "${args[@]}" -monitor "unix:$sock,server,nowait" &
+pid=$!
+sleep "$secs"
+python3 - "$sock" "$raw" <<'EOF'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+time.sleep(0.3)
+s.sendall(f'pmemsave 0x7e000000 {1920 * 1080 * 4} "{sys.argv[2]}"\n'.encode())
+time.sleep(2)
+s.sendall(b'quit\n')
+time.sleep(0.5)
+EOF
+wait "$pid" 2>/dev/null || true
+python3 ../tools/fb2png.py "$raw" "$FBDUMP" 1920 1080
+rm -f "$raw" "$sock"

@@ -15,6 +15,7 @@
 
 #define UART10_FALLBACK		0x107d001000UL	/* bcm2712 debug UART (JST header) */
 #define NR_CPUS			4
+#define QEMU_FAKE_FB		0x7e000000UL	/* QEMU virt RAM, below payload/kernel use */
 
 /* GICv2 (GIC-400) */
 #define GICD_CTLR		0x000
@@ -200,8 +201,22 @@ static void setup_fb(uintptr_t fdt)
 	struct fdt_node n;
 	uint64_t addr, size;
 	uint32_t w = 0, h = 0, stride = 0, bpp = 32;
-	if (!fdt_find_compatible(fdt, "simple-framebuffer", 0, &n) || !fdt_reg(fdt, &n, 0, &addr, &size))
+	if (!fdt_find_compatible(fdt, "simple-framebuffer", 0, &n) || !fdt_reg(fdt, &n, 0, &addr, &size)) {
+		/*
+		 * QEMU virt has no framebuffer. Report a fake 1920x1080 one in spare
+		 * guest RAM so xnu's early-console path (start.s VA=PA block, the
+		 * final kernel mapping in arm_vm_init) runs exactly as on a Pi; dump
+		 * it from the QEMU monitor (pmemsave) to see what was drawn.
+		 */
+		if (fdt_find_compatible(fdt, "linux,dummy-virt", 0, &n)) {
+			video.base = QEMU_FAKE_FB;
+			video.width = 1920;
+			video.height = 1080;
+			video.stride = 1920 * 4;
+			pr("QEMU: fake framebuffer %lx 1920x1080 (RAM, see qemu.sh)\n", video.base);
+		}
 		return;
+	}
 	fdt_prop_u32(fdt, &n, "width", &w);
 	fdt_prop_u32(fdt, &n, "height", &h);
 	fdt_prop_u32(fdt, &n, "stride", &stride);
