@@ -29,7 +29,9 @@ screen (image versions v8-v14 in NOTES.md):
 """
 import glob, os, plistlib, shutil, sys
 
-BUILD, VERSION = '20H392', '16.7.16'
+# The image's iOS build (phone: iOS 16.7.16; Pi 5: SWEET_BUILD=20G81 SWEET_VERSION=16.6.1).
+BUILD = os.environ.get('SWEET_BUILD', '20H392')
+VERSION = os.environ.get('SWEET_VERSION', '16.7.16')
 MOBILE = 501
 
 

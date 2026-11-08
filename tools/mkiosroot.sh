@@ -113,19 +113,29 @@ done
 # logd's log stores, normally made at restore: it checks owner _logd (272)
 # and mode, plus a .migrated marker, else asks a helper and crashes
 # ("BUG IN LIBTRACE: Failed to migrate directory").
+# Owners are iOS IDs with no entry in the build host's passwd/group: set them
+# with chown, which takes numeric IDs everywhere (uutils install, Ubuntu 26.04's
+# default, rejects "-o 272": "invalid user").
+mkdir_own() { # DIR UID:GID MODE
+	sudo mkdir -p "$1" && sudo chown "$2" "$1" && sudo chmod "$3" "$1"
+}
+file_own() { # FILE UID:GID MODE  (content from stdin)
+	sudo tee "$1" > /dev/null && sudo chown "$2" "$1" && sudo chmod "$3" "$1"
+}
 db="$work/root/private/var/db"
-sudo install -d -o 272 -g 272 -m 0751 "$db/diagnostics"
-sudo install -d -o 272 -g 272 -m 0755 "$db/uuidtext" "$db/diagnostics/timesync"
+mkdir_own "$db/diagnostics" 272:272 0751
+mkdir_own "$db/uuidtext" 272:272 0755
+mkdir_own "$db/diagnostics/timesync" 272:272 0755
 for d in diagnostics uuidtext diagnostics/timesync; do
-	sudo install -o 272 -g 272 -m 0644 /dev/null "$db/$d/.migrated"
+	file_own "$db/$d/.migrated" 272:272 0644 < /dev/null
 done
 
 # System keybag for the built-in AppleKeyStore (no passcode).
-sudo install -d -m 0700 -o 0 -g 0 "$work/root/private/var/keybags"
+mkdir_own "$work/root/private/var/keybags" 0:0 0700
 printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
-	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
+	file_own "$work/root/private/var/keybags/systembag.kb" 0:0 0600
 
 df -h "$work/root"
 sudo umount "$work/root"

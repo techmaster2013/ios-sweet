@@ -1,0 +1,3212 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..468b01d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_sd.c			standard
++bsd/dev/sweet_xhci.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
+new file mode 100644
+index 0000000..2e545f3
+--- /dev/null
++++ b/bsd/dev/sweet_sd.c
+@@ -0,0 +1,830 @@
++/*
++ * SWEET (Raspberry Pi 5) SD card root device.
++ *
++ * The BCM2712 SD host (brcm,bcm2712-sdhci, a standard SDHCI 3.0 controller at
++ * the ADT /sweet-sd node: reg = <host size cfg size>, absolute physical) is
++ * the one the Pi firmware loaded this kernel through. This driver
++ * re-initialises the card from CMD0 at 400 kHz, brings it to 4-bit 25 MHz
++ * default speed and moves data with polled PIO through the buffer data port
++ * (no DMA, no interrupts), one command at a time.
++ *
++ * Signalling voltage is left as the firmware set it: a card the firmware
++ * switched to 1.8 V stays at 1.8 V until power-cycled (CMD0 does not undo
++ * it), so the host's 1.8 V enable is kept; only the UHS timing mode is reset
++ * to SDR12, which default-speed operation at 25 MHz uses at either voltage.
++ *
++ * It finds one MBR partition (boot-arg sdpart=1..4, else the first of type
++ * 0xAF, HFS+) and exposes it as the BSD disk sdroot0 (rsdroot0). Root on it
++ * with rd=sdroot0. Writes are refused unless boot-arg sdrw=1, and every write
++ * is checked against the partition bounds right before it is issued.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++/* Console ring (bsd/dev/sweet_ufs.c, fed by _cnputs). */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++static void sweet_sd_log_start(void);
++extern void sweet_xhci_start(void);
++
++/* SDHCI registers, all accessed as aligned 32-bit words. */
++#define SD_BLK          0x04    /* [11:0] block size, [31:16] block count */
++#define SD_ARG          0x08
++#define SD_XFER         0x0c    /* [15:0] transfer mode, [31:16] command */
++#define SD_RESP0        0x10
++#define SD_DATA         0x20
++#define SD_PRESENT      0x24
++#define SD_HOSTCTL      0x28    /* [7:0] host control 1, [15:8] power control */
++#define SD_CLKCTL       0x2c    /* [15:0] clock, [19:16] timeout, [26:24] reset */
++#define SD_INT          0x30    /* [15:0] normal status, [31:16] error status */
++#define SD_INT_EN       0x34
++#define SD_SIG_EN       0x38
++#define SD_CTRL2        0x3c    /* [31:16] host control 2 */
++#define SD_CAPS         0x40
++#define SD_VERSION      0xfc    /* [31:16] host controller version */
++
++#define CFG_CTRL        0x00    /* brcmstb SDIO_CFG_CTRL */
++#define CFG_CD_TEST_EN  (1u << 31)
++#define CFG_CD_TEST_LEV (1u << 30)
++
++#define PRES_CMD_INH    (1u << 0)
++#define PRES_DAT_INH    (1u << 1)
++#define PRES_CARD       (1u << 16)
++#define PRES_DAT0       (1u << 20)
++
++#define INT_CMD_DONE    (1u << 0)
++#define INT_XFER_DONE   (1u << 1)
++#define INT_BUF_WR      (1u << 4)
++#define INT_BUF_RD      (1u << 5)
++#define INT_ERR         (1u << 15)
++
++#define CLK_INT_EN      (1u << 0)
++#define CLK_INT_STABLE  (1u << 1)
++#define CLK_CARD_EN     (1u << 2)
++#define RST_ALL         (1u << 24)
++#define RST_CMD         (1u << 25)
++#define RST_DAT         (1u << 26)
++
++#define HC1_4BIT        (1u << 1)
++#define HC2_1V8         (1u << (16 + 3))
++
++/* Command register flags: response type, CRC/index checks, data present. */
++#define R_NONE          0x00
++#define R_R2            0x09
++#define R_R3            0x02
++#define R_R1            0x1a    /* also R6, R7 */
++#define R_R1B           0x1b
++#define F_DATA          0x20
++
++/* Transfer mode */
++#define TM_BLKCNT       (1u << 1)
++#define TM_ACMD12       (1u << 2)
++#define TM_READ         (1u << 4)
++#define TM_MULTI        (1u << 5)
++
++#define SD_BLOCK        512u
++#define SD_MAX_BLOCKS   2048u                   /* per command: 1 MiB */
++#define SD_TIMEOUT_NS   (2ull * NSEC_PER_SEC)
++
++static struct {
++	vm_offset_t regs, cfg;
++	uint32_t base_hz;
++	uint32_t rca;
++	bool ccs;                               /* block (not byte) addressed */
++	uint64_t card_blocks;                   /* from the CSD, 0 if unknown */
++	uint64_t first_block, nblocks;          /* partition, in 512-byte blocks */
++	uint64_t log_first, log_nblocks;        /* console log partition (MBR type 0xDA) */
++	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool writable;                          /* boot-arg sdrw=1 */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} sd;
++
++static LCK_GRP_DECLARE(sweet_sd_grp, "sweet_sd");
++static LCK_MTX_DECLARE(sweet_sd_lock, &sweet_sd_grp);
++
++static inline uint32_t
++sd_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sd.regs + off);
++}
++
++static inline void
++sd_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(sd.regs + off) = v;
++}
++
++static uint64_t
++sd_deadline(void)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(SD_TIMEOUT_NS, &t);
++	return mach_absolute_time() + t;
++}
++
++/* Wait until (reg & mask) == want. */
++static int
++sd_wait(uint32_t off, uint32_t mask, uint32_t want)
++{
++	uint64_t deadline = sd_deadline();
++	while ((sd_rd(off) & mask) != want) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++static void
++sd_reset(uint32_t bits)
++{
++	sd_wr(SD_CLKCTL, sd_rd(SD_CLKCTL) | bits);
++	if (sd_wait(SD_CLKCTL, bits, 0)) {
++		printf("SWEET SD: reset 0x%x did not complete\n", bits);
++	}
++}
++
++/* Wait for any of the status bits in want (or an error), then ack them. */
++static int
++sd_wait_int(uint32_t want, const char *what, uint32_t cmd)
++{
++	uint64_t deadline = sd_deadline();
++	uint32_t st;
++	while (!((st = sd_rd(SD_INT)) & (want | INT_ERR))) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET SD: CMD%u %s timed out (status 0x%x present 0x%x)\n",
++			    cmd, what, st, sd_rd(SD_PRESENT));
++			sd_reset(RST_CMD | RST_DAT);
++			return ETIMEDOUT;
++		}
++	}
++	if (st & INT_ERR) {
++		printf("SWEET SD: CMD%u %s error 0x%04x (present 0x%x)\n",
++		    cmd, what, st >> 16, sd_rd(SD_PRESENT));
++		sd_wr(SD_INT, st);
++		sd_reset(RST_CMD | RST_DAT);
++		return EIO;
++	}
++	sd_wr(SD_INT, st & want);
++	return 0;
++}
++
++/*
++ * Issue one command. For data commands the caller then moves the blocks
++ * through SD_DATA. resp (4 words, may be NULL) receives the response.
++ */
++static int
++sd_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t mode, uint32_t blocks,
++    uint32_t resp[4])
++{
++	uint32_t inhibit = PRES_CMD_INH | ((flags & F_DATA) || flags == R_R1B ? PRES_DAT_INH : 0);
++	if (sd_wait(SD_PRESENT, inhibit, 0)) {
++		printf("SWEET SD: CMD%u: line busy (present 0x%x)\n", idx, sd_rd(SD_PRESENT));
++		sd_reset(RST_CMD | RST_DAT);
++		return ETIMEDOUT;
++	}
++	sd_wr(SD_INT, 0xffffffff);
++	if (flags & F_DATA) {
++		sd_wr(SD_BLK, SD_BLOCK | (blocks << 16));
++	}
++	sd_wr(SD_ARG, arg);
++	sd_wr(SD_XFER, mode | ((idx << 8 | flags) << 16));
++	int error = sd_wait_int(INT_CMD_DONE, "command", idx);
++	if (error) {
++		return error;
++	}
++	if (resp) {
++		for (int i = 0; i < 4; i++) {
++			resp[i] = sd_rd(SD_RESP0 + 4 * i);
++		}
++	}
++	if (flags == R_R1B) {
++		error = sd_wait_int(INT_XFER_DONE, "busy", idx);
++	}
++	return error;
++}
++
++static int
++sd_acmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t resp[4])
++{
++	int error = sd_cmd(55, sd.rca << 16, R_R1, 0, 0, NULL);
++	return error ? error : sd_cmd(idx, arg, flags, 0, 0, resp);
++}
++
++static int
++sd_set_clock(uint32_t hz)
++{
++	uint32_t c = sd_rd(SD_CLKCTL) & ~0x000fffffu;
++	sd_wr(SD_CLKCTL, c);                    /* stop the clock */
++	uint32_t div = 0;
++	if (sd.base_hz > hz) {
++		div = (sd.base_hz + 2 * hz - 1) / (2 * hz);
++		div = MIN(div, 1023u);
++	}
++	c |= (div & 0xff) << 8 | ((div >> 8) & 3) << 6 | 0xeu << 16 | CLK_INT_EN;
++	sd_wr(SD_CLKCTL, c);
++	if (sd_wait(SD_CLKCTL, CLK_INT_STABLE, CLK_INT_STABLE)) {
++		printf("SWEET SD: clock did not stabilise\n");
++		return ETIMEDOUT;
++	}
++	sd_wr(SD_CLKCTL, sd_rd(SD_CLKCTL) | CLK_CARD_EN);
++	delay(2000);
++	printf("SWEET SD: card clock %u kHz (divider %u)\n",
++	    div ? sd.base_hz / (2 * div) / 1000 : sd.base_hz / 1000, div);
++	return 0;
++}
++
++/* PIO: n blocks (n >= 1) between the card and buf, which may be unaligned. */
++static int
++sd_xfer(uint64_t lba, uint32_t n, uint8_t *buf, bool write)
++{
++	uint32_t addr = (uint32_t)(sd.ccs ? lba : lba * SD_BLOCK);
++	uint32_t mode = (write ? 0 : TM_READ) | (n > 1 ? TM_MULTI | TM_BLKCNT | TM_ACMD12 : 0);
++	uint32_t idx = write ? (n > 1 ? 25 : 24) : (n > 1 ? 18 : 17);
++
++	if ((!sd.ccs && lba * SD_BLOCK > UINT32_MAX) || lba > UINT32_MAX) {
++		return EINVAL;
++	}
++	int error = sd_cmd(idx, addr, R_R1 | F_DATA, mode, n, NULL);
++	if (error) {
++		return error;
++	}
++	for (uint32_t b = 0; b < n; b++) {
++		error = sd_wait_int(write ? INT_BUF_WR : INT_BUF_RD, "data", idx);
++		if (error) {
++			return error;
++		}
++		uint8_t *p = buf + (size_t)b * SD_BLOCK;
++		for (uint32_t i = 0; i < SD_BLOCK; i += 4) {
++			uint32_t w;
++			if (write) {
++				memcpy(&w, p + i, 4);
++				sd_wr(SD_DATA, w);
++			} else {
++				w = sd_rd(SD_DATA);
++				memcpy(p + i, &w, 4);
++			}
++		}
++	}
++	/* For writes this also covers the card's programming busy. */
++	return sd_wait_int(INT_XFER_DONE, "transfer", idx);
++}
++
++static int
++sd_read(uint64_t lba, uint32_t n, uint8_t *buf)
++{
++	return sd_xfer(lba, n, buf, false);
++}
++
++/* The only place data goes to the card: inside the partition, or nothing. */
++static int
++sd_write(uint64_t lba, uint32_t n, uint8_t *buf)
++{
++	if (!sd.writable || !sd.nblocks || n == 0 || lba < sd.first_block ||
++	    lba - sd.first_block >= sd.nblocks || n > sd.nblocks - (lba - sd.first_block)) {
++		printf("SWEET SD: refusing write of %u blocks at 0x%llx\n", n, lba);
++		return EPERM;
++	}
++	return sd_xfer(lba, n, buf, true);
++}
++
++static int
++sd_card_init(void)
++{
++	uint32_t r[4];
++	int error;
++
++	uint32_t present = sd_rd(SD_PRESENT), caps = sd_rd(SD_CAPS);
++	printf("SWEET SD: SDHCI version 0x%x caps 0x%x present 0x%x hostctl 0x%x clk 0x%x ctrl2 0x%x cfg 0x%x\n",
++	    sd_rd(SD_VERSION) >> 16, caps, present, sd_rd(SD_HOSTCTL), sd_rd(SD_CLKCTL),
++	    sd_rd(SD_CTRL2) >> 16, sd.cfg ? *(volatile uint32_t *)(sd.cfg + CFG_CTRL) : 0);
++	sd.base_hz = ((caps >> 8) & 0xff) * 1000000u;
++	if (!sd.base_hz) {
++		sd.base_hz = 200000000u;        /* the Pi 5 emmc2 clock */
++	}
++	PE_parse_boot_argn("sdbase", &sd.base_hz, sizeof(sd.base_hz));
++
++	/*
++	 * The Pi 5 card-detect pin is a GPIO, not the host's: force "inserted",
++	 * first through the brcmstb config block, then the SDHCI test bits.
++	 */
++	if (!(present & PRES_CARD) && sd.cfg) {
++		volatile uint32_t *cfg = (volatile uint32_t *)(sd.cfg + CFG_CTRL);
++		*cfg |= CFG_CD_TEST_EN | CFG_CD_TEST_LEV;
++		delay(1000);
++		present = sd_rd(SD_PRESENT);
++	}
++	if (!(present & PRES_CARD)) {
++		sd_wr(SD_HOSTCTL, sd_rd(SD_HOSTCTL) | (3u << 6));
++		delay(1000);
++		present = sd_rd(SD_PRESENT);
++	}
++	printf("SWEET SD: present 0x%x (card %s)\n", present, present & PRES_CARD ? "detected" : "NOT detected");
++
++	sd_reset(RST_CMD | RST_DAT);
++	uint32_t hc = sd_rd(SD_HOSTCTL);
++	if (!(hc & (1u << 8))) {
++		hc = (hc & ~0xff00u) | (0x0fu << 8);    /* 3.3 V, bus power on */
++		sd_wr(SD_HOSTCTL, hc);
++		delay(20000);
++	}
++	sd_wr(SD_HOSTCTL, hc & ~0x3eu);         /* 1-bit, normal speed, no DMA */
++	uint32_t c2 = sd_rd(SD_CTRL2);
++	bool v18 = (c2 & HC2_1V8) != 0;
++	/* UHS mode SDR12, no tuning, no preset values; keep the signalling voltage. */
++	sd_wr(SD_CTRL2, c2 & ~((7u << 16) | (3u << 22) | (1u << 31)));
++	sd_wr(SD_INT_EN, 0xffff00ffu);
++	sd_wr(SD_SIG_EN, 0);
++	sd_wr(SD_INT, 0xffffffff);
++
++	if ((error = sd_set_clock(400000))) {
++		return error;
++	}
++
++	sd.rca = 0;
++	sd_cmd(0, 0, R_NONE, 0, 0, NULL);       /* GO_IDLE_STATE */
++	delay(2000);
++	bool v2 = sd_cmd(8, 0x1aa, R_R1, 0, 0, r) == 0 && (r[0] & 0xfff) == 0x1aa;
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &deadline);
++	deadline += mach_absolute_time();
++	do {
++		error = sd_acmd(41, (v2 ? 1u << 30 : 0) | 0x00ff8000u, R_R3, r);
++		if (error) {
++			return error;
++		}
++		if (r[0] & (1u << 31)) {
++			break;
++		}
++		delay(10000);
++	} while (mach_absolute_time() < deadline);
++	if (!(r[0] & (1u << 31))) {
++		printf("SWEET SD: card never left power-up (OCR 0x%x)\n", r[0]);
++		return ETIMEDOUT;
++	}
++	sd.ccs = (r[0] >> 30) & 1;
++	printf("SWEET SD: OCR 0x%08x (%s, %s signalling)\n", r[0],
++	    sd.ccs ? "SDHC/SDXC" : "SDSC", v18 ? "1.8 V" : "3.3 V");
++
++	if ((error = sd_cmd(2, 0, R_R2, 0, 0, r))) {          /* ALL_SEND_CID */
++		return error;
++	}
++	/* CID bits [127:8] are in RESP[119:0]: product name [103:64] at RESP[95:56]. */
++	char pnm[6] = {
++		(char)(r[2] >> 24), (char)(r[2] >> 16), (char)(r[2] >> 8),
++		(char)(r[2] >> 0), (char)(r[1] >> 24), 0
++	};
++	for (int i = 0; i < 5; i++) {
++		if (pnm[i] < 0x20 || pnm[i] > 0x7e) {
++			pnm[i] = '?';
++		}
++	}
++	if ((error = sd_cmd(3, 0, R_R1, 0, 0, r))) {          /* SEND_RELATIVE_ADDR */
++		return error;
++	}
++	sd.rca = r[0] >> 16;
++	if ((error = sd_cmd(9, sd.rca << 16, R_R2, 0, 0, r))) { /* SEND_CSD */
++		return error;
++	}
++	if (((r[3] >> 22) & 3) == 1) {          /* CSD version 2: C_SIZE in [69:48] */
++		sd.card_blocks = ((uint64_t)((r[1] >> 8) & 0x3fffff) + 1) * 1024;
++	}
++	printf("SWEET SD: card \"%s\" rca 0x%x, %llu MiB\n", pnm, sd.rca, sd.card_blocks >> 11);
++	if ((error = sd_cmd(7, sd.rca << 16, R_R1B, 0, 0, NULL))) {     /* SELECT_CARD */
++		return error;
++	}
++	if ((error = sd_acmd(6, 2, R_R1, NULL))) {               /* 4-bit bus */
++		return error;
++	}
++	sd_wr(SD_HOSTCTL, sd_rd(SD_HOSTCTL) | HC1_4BIT);
++	if ((error = sd_cmd(16, SD_BLOCK, R_R1, 0, 0, NULL))) {
++		return error;
++	}
++	uint32_t hz = 25000000;
++	PE_parse_boot_argn("sdclk", &hz, sizeof(hz));
++	return sd_set_clock(MIN(hz, 25000000u));
++}
++
++static int
++sd_find_partition(void)
++{
++	static uint8_t b[SD_BLOCK];
++	int error = sd_read(0, 1, b);
++	if (error) {
++		return error;
++	}
++	if (b[510] != 0x55 || b[511] != 0xaa) {
++		printf("SWEET SD: no MBR on the card\n");
++		return ENXIO;
++	}
++	uint32_t want = 0;
++	PE_parse_boot_argn("sdpart", &want, sizeof(want));
++	int pick = -1;
++	for (int i = 0; i < 4; i++) {
++		const uint8_t *e = b + 446 + 16 * i;
++		uint32_t start, count;
++		memcpy(&start, e + 8, 4);
++		memcpy(&count, e + 12, 4);
++		printf("SWEET SD: MBR partition %d: type 0x%02x, start %u, %u MiB\n",
++		    i + 1, e[4], start, count >> 11);
++		if (pick < 0 && count && (want ? (uint32_t)i + 1 == want : e[4] == 0xaf)) {
++			pick = i;
++			sd.first_block = start;
++			sd.nblocks = count;
++		}
++		if (e[4] == 0xda && !sd.log_nblocks && count &&
++		    (!sd.card_blocks || (uint64_t)start + count <= sd.card_blocks)) {
++			sd.log_first = start;
++			sd.log_nblocks = count;
++		}
++	}
++	if (pick < 0) {
++		printf("SWEET SD: no %s partition\n", want ? "sdpart=" : "type 0xAF (HFS+)");
++		return ENOENT;
++	}
++	if (sd.card_blocks && sd.first_block + sd.nblocks > sd.card_blocks) {
++		printf("SWEET SD: partition %d runs past the end of the card\n", pick + 1);
++		return ENXIO;
++	}
++	/* HFS+ volume header at byte 1024: signature "H+" or "HX". */
++	if ((error = sd_read(sd.first_block + 2, 1, b))) {
++		return error;
++	}
++	printf("SWEET SD: partition %d volume signature %c%c\n", pick + 1,
++	    b[0] >= 0x20 && b[0] < 0x7f ? b[0] : '?', b[1] >= 0x20 && b[1] < 0x7f ? b[1] : '?');
++	return 0;
++}
++
++static int
++sweet_sd_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!sd.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !sd.writable) ? EROFS : 0;
++}
++
++static int
++sweet_sd_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_sd_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * sd.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = sd.nblocks * SD_BLOCK;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !sd.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off || (off | count) % SD_BLOCK) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++	lck_mtx_lock(&sweet_sd_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint32_t n = MIN((count - done) / SD_BLOCK, SD_MAX_BLOCKS);
++		uint64_t lba = sd.first_block + (off + done) / SD_BLOCK;
++		error = rd ? sd_read(lba, n, (uint8_t *)vaddr + done) :
++		    sd_write(lba, n, (uint8_t *)vaddr + done);
++		if (error) {
++			break;
++		}
++		done += n * SD_BLOCK;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_sd_lock);
++	buf_unmap(bp);
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_sd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = sd.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		sd.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = SD_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = sd.nblocks * SD_BLOCK / sd.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = sd.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;                       /* every write completes on the card */
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = SD_MAX_BLOCKS * SD_BLOCK / sd.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = sd.writable ? SD_MAX_BLOCKS * SD_BLOCK / sd.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_sd_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_sd_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_sd_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_sd_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++sweet_sd_psize(__unused dev_t dev)
++{
++	return sd.ready ? (int)MIN(sd.nblocks * SD_BLOCK / sd.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_sd_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_sd_strategy, NULL, dev, B_READ, minphys, uio, (int)sd.secsize);
++}
++
++static int
++sweet_sd_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!sd.writable) {
++		return EROFS;
++	}
++	return physio(sweet_sd_strategy, NULL, dev, B_WRITE, minphys, uio, (int)sd.secsize);
++}
++
++static const struct bdevsw sweet_sd_bdevsw = {
++	.d_open     = sweet_sd_open,
++	.d_close    = sweet_sd_close,
++	.d_strategy = sweet_sd_strategy,
++	.d_ioctl    = sweet_sd_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_sd_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_sd_cdevsw = {
++	.d_open       = sweet_sd_open,
++	.d_close      = sweet_sd_close,
++	.d_read       = sweet_sd_read,
++	.d_write      = sweet_sd_write,
++	.d_ioctl      = sweet_sd_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++sweet_sd_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-sd", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET SD: no /sweet-sd node in the device tree\n");
++		return ENXIO;
++	}
++	sd.regs = ml_io_map(reg[0], reg[1]);
++	if (size >= 4 * sizeof(uintptr_t)) {
++		sd.cfg = ml_io_map(reg[2], reg[3]);
++	}
++	uint32_t rw = 0;
++	PE_parse_boot_argn("sdrw", &rw, sizeof(rw));
++	sd.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_sd_lock);
++	int error = sd_card_init();
++	if (!error) {
++		error = sd_find_partition();
++	}
++	lck_mtx_unlock(&sweet_sd_lock);
++	if (error) {
++		return error;
++	}
++
++	sd.bmajor = bdevsw_add(-1, &sweet_sd_bdevsw);
++	if (sd.bmajor < 0) {
++		return ENXIO;
++	}
++	sd.cmajor = cdevsw_add_with_bdev(-1, &sweet_sd_cdevsw, sd.bmajor);
++	if (sd.cmajor < 0) {
++		return ENXIO;
++	}
++	sd.bdev = makedev(sd.bmajor, 0);
++	devfs_make_node(sd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "sdroot0");
++	devfs_make_node(makedev(sd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rsdroot0");
++	/* Only now, with the partition bounds known, can writes be allowed. */
++	sd.writable = (rw != 0);
++	sd.ready = true;
++	printf("SWEET SD: root partition at block %llu, %llu MiB, %s\n",
++	    sd.first_block, sd.nblocks >> 11, sd.writable ? "read-write" : "read-only");
++	sweet_sd_log_start();
++	sweet_xhci_start();             /* USB keyboard/mouse (bsd/dev/sweet_xhci.c) */
++	return 0;
++}
++
++/*
++ * Persistent console log on the SD card. The console ring kept by
++ * sweet_ufs.c (every _cnputs byte: kernel printf and daemons' /dev/console)
++ * is copied every sdlogsecs seconds (default 2) to the MBR partition of type
++ * 0xDA, in the phone's format (tools/sweet-log.py): bytes [0, 4096) a header
++ *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes | u64 flush seq
++ * then the 4 MiB ring, console byte n at ring offset n % size. Only that
++ * partition is ever written here (sd_log_write). Disabled with sdlog=0.
++ */
++#define SDLOG_RING      (4u << 20)
++#define SDLOG_HDR       (4096u / SD_BLOCK)
++#define SDLOG_BLOCKS    (SDLOG_HDR + SDLOG_RING / SD_BLOCK)
++#define SDLOG_CHUNK     (64u << 10)
++
++static uint8_t sdlog_buf[SDLOG_CHUNK];
++static int sdlog_chan;
++static uint32_t sdlog_secs = 2;
++
++static int
++sd_log_write(uint64_t rel, uint32_t n, uint8_t *buf)
++{
++	if (!sd.log_nblocks || n == 0 || rel >= SDLOG_BLOCKS || n > SDLOG_BLOCKS - rel ||
++	    SDLOG_BLOCKS > sd.log_nblocks) {
++		printf("SWEET SD: refusing log write of %u blocks at +%llu\n", n, rel);
++		return EPERM;
++	}
++	return sd_xfer(sd.log_first + rel, n, buf, true);
++}
++
++static void
++sweet_sd_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t flushed = 0, seq = 0;
++
++	printf("SWEET SD LOG: console log to partition at block %llu every %u s\n",
++	    sd.log_first, sdlog_secs);
++	for (;;) {
++		(void)tsleep(&sdlog_chan, PZERO, "sdlog", hz * (int)sdlog_secs);
++		uint64_t total = sweet_log_position();
++		if (total == flushed) {
++			continue;
++		}
++		/* Rewrite from the start of the sector holding the first new byte. */
++		uint64_t pos = flushed & ~(uint64_t)(SD_BLOCK - 1);
++		if (total - pos > SDLOG_RING) {
++			pos = (total - SDLOG_RING + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
++		}
++		int error = 0;
++		lck_mtx_lock(&sweet_sd_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % SDLOG_RING);
++			uint32_t want = (uint32_t)MIN(MIN(total - pos, (uint64_t)SDLOG_CHUNK),
++			    (uint64_t)(SDLOG_RING - off));
++			uint64_t p = pos;
++			uint32_t got = sweet_log_copy(&p, (char *)sdlog_buf, want);
++			if (p - got != pos) {
++				/* Fell a whole ring behind: restart at a sector boundary. */
++				pos = (p - got + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
++				continue;
++			}
++			if (got == 0) {
++				break;
++			}
++			uint32_t blocks = (got + SD_BLOCK - 1) / SD_BLOCK;
++			bzero(sdlog_buf + got, blocks * SD_BLOCK - got);
++			error = sd_log_write(SDLOG_HDR + off / SD_BLOCK, blocks, sdlog_buf);
++			pos += got;
++		}
++		if (!error) {
++			struct {
++				char magic[8];
++				uint32_t version, size;
++				uint64_t total, seq;
++			} h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = SDLOG_RING, .total = total, .seq = ++seq,
++			};
++			bzero(sdlog_buf, SD_BLOCK);
++			memcpy(sdlog_buf, &h, sizeof(h));
++			error = sd_log_write(0, 1, sdlog_buf);
++		}
++		lck_mtx_unlock(&sweet_sd_lock);
++		if (error) {
++			printf("SWEET SD LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++sweet_sd_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sdlog", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (sd.log_nblocks < SDLOG_BLOCKS) {
++		printf("SWEET SD LOG: no log partition (MBR type 0xDA, >= %u KiB)\n",
++		    SDLOG_BLOCKS / 2);
++		return;
++	}
++	PE_parse_boot_argn("sdlogsecs", &sdlog_secs, sizeof(sdlog_secs));
++	if (sdlog_secs == 0 || sdlog_secs > 60) {
++		sdlog_secs = 2;
++	}
++	if (kernel_thread_start(sweet_sd_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/* Root device for rd=sdroot0 (IOFindBSDRoot). */
++int sweet_sd_rootdev(dev_t *dev);
++
++int
++sweet_sd_rootdev(dev_t *dev)
++{
++	if (!sd.ready) {
++		int error = sweet_sd_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = sd.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
+new file mode 100644
+index 0000000..2313bea
+--- /dev/null
++++ b/bsd/dev/sweet_xhci.c
+@@ -0,0 +1,1251 @@
++/*
++ * SWEET (Raspberry Pi 5) USB keyboard and mouse.
++ *
++ * The Pi 5 USB ports are on RP1, behind the PCIe x4 link the firmware brings
++ * up (config.txt pciex4_reset=0 keeps it, with RP1's BAR at CPU 0x1f00000000).
++ * RP1 has two DWC3 controllers in xHCI host mode (ADT /sweet-xhci reg). This
++ * driver resets each one, then from one polling thread (no interrupts):
++ *
++ *   - enumerates devices on the root ports (no hubs yet), also on hotplug;
++ *   - for every HID boot interface (keyboard, mouse) switches it to the boot
++ *     protocol and keeps one interrupt-IN transfer queued;
++ *   - turns reports into iPadOS HID events (iokit/Kernel/arm/hid/SweetHID.cpp):
++ *     keyboard usages to SweetHIDKeyboard, mouse motion/buttons/wheel to
++ *     SweetHIDPointer. Esc and F1 are the Home button, F2 the side (lock) button.
++ *
++ * DMA memory is one physically contiguous cacheable allocation; every
++ * structure is cleaned+invalidated (dsync) right after the CPU writes it and
++ * before the CPU reads what the controller wrote, so it works whether or not
++ * the PCIe path is coherent. RP1 sees host memory at PA + dma-offset
++ * (0x10_0000_0000 on the Pi 5).
++ * Boot-args: xhci=0 disables the driver, xhcidebug=1 logs every report.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void IOSleep(unsigned milliseconds);
++/* iokit/Kernel/arm/hid/SweetHID.cpp */
++extern void sweet_hid_kbd(unsigned page, unsigned usage, int down);
++extern void sweet_hid_pointer(int dx, int dy, unsigned buttons, int wheel, int hwheel);
++extern void sweet_hid_key(int key, int down);
++
++/* Capability registers */
++#define CAP_LENGTH      0x00
++#define CAP_HCSPARAMS1  0x04
++#define CAP_HCSPARAMS2  0x08
++#define CAP_HCCPARAMS1  0x10
++#define CAP_DBOFF       0x14
++#define CAP_RTSOFF      0x18
++/* Operational registers */
++#define OP_USBCMD       0x00
++#define OP_USBSTS       0x04
++#define OP_PAGESIZE     0x08
++#define OP_CRCR         0x18
++#define OP_DCBAAP       0x30
++#define OP_CONFIG       0x38
++#define OP_PORTSC(n)    (0x400 + 0x10 * ((n) - 1))
++#define CMD_RS          (1u << 0)
++#define CMD_HCRST       (1u << 1)
++#define STS_HCH         (1u << 0)
++#define STS_CNR         (1u << 11)
++/* PORTSC */
++#define PS_CCS          (1u << 0)
++#define PS_PED          (1u << 1)
++#define PS_PR           (1u << 4)
++#define PS_PP           (1u << 9)
++#define PS_CSC          (1u << 17)
++#define PS_PRC          (1u << 21)
++#define PS_CHANGES      (0x7fu << 17)
++#define PS_KEEP         ((1u << 0) | (1u << 3) | (0xfu << 10) | (1u << 24) | (1u << 30) | \
++	                 (0xfu << 5) | (1u << 9) | (3u << 14) | (7u << 25))
++/* Interrupter 0 (runtime base + 0x20) */
++#define IR_IMAN         0x20
++#define IR_ERSTSZ       0x28
++#define IR_ERSTBA       0x30
++#define IR_ERDP         0x38
++/* DWC3 global control */
++#define DWC3_GCTL       0xc110
++
++/* TRB types */
++#define TRB_NORMAL      1
++#define TRB_SETUP       2
++#define TRB_DATA        3
++#define TRB_STATUS      4
++#define TRB_LINK        6
++#define TRB_ENABLE_SLOT 9
++#define TRB_DISABLE_SLOT 10
++#define TRB_ADDRESS_DEV 11
++#define TRB_CONFIG_EP   12
++#define TRB_EVAL_CTX    13
++#define TRB_EV_TRANSFER 32
++#define TRB_EV_CMD      33
++#define TRB_EV_PORT     34
++#define TRB_C           (1u << 0)
++#define TRB_TC          (1u << 1)       /* link: toggle cycle */
++#define TRB_ISP         (1u << 2)
++#define TRB_IOC         (1u << 5)
++#define TRB_IDT         (1u << 6)
++#define TRB_TYPE(t)     ((uint32_t)(t) << 10)
++#define CC_SUCCESS      1
++#define CC_SHORT        13
++
++struct trb {
++	uint32_t p0, p1, status, ctrl;
++};
++
++#define MAX_HC          2
++#define MAX_DEV         4               /* per controller */
++#define MAX_HID         2               /* HID interfaces per device */
++#define CMD_TRBS        64
++#define EVT_TRBS        256
++#define EP0_TRBS        64
++#define INT_TRBS        32
++
++/* DMA layout (offsets in the per-controller allocation) */
++#define D_DCBAA         0x0000          /* 256 x u64 */
++#define D_ERST          0x0800
++#define D_CMD           0x1000
++#define D_EVT           0x2000
++#define D_SPARR         0x3000          /* scratchpad pointer array (<= 256) */
++#define D_DEV(d)        (0x4000 + (d) * 0x3000)
++#define DV_IN           0x0000          /* input context (<= 33 x 64) */
++#define DV_OUT          0x1000          /* device context (32 x 64) */
++#define DV_EP0          0x1800
++#define DV_INT(i)       (0x1c00 + (i) * 0x200)
++#define DV_BUF          0x2000          /* control transfer data, 1 KiB */
++#define DV_REP(i)       (0x2400 + (i) * 0x40)
++#define D_SP            (D_DEV(MAX_DEV))        /* scratchpad pages */
++
++struct ring {
++	struct trb *t;
++	uint64_t dma;
++	uint32_t n, enq;
++	uint32_t pcs;
++};
++
++/*
++ * Mouse report layout from its HID report descriptor (report protocol), so
++ * the wheel works: boot protocol only guarantees buttons + X/Y (3 bytes).
++ * Offsets are in bits from the first byte after the report ID (if any).
++ */
++struct field {
++	uint16_t off;
++	uint8_t size;                   /* 0: absent */
++};
++
++struct mouse_layout {
++	bool valid, ids;                /* ids: reports start with a report ID byte */
++	uint8_t rid;                    /* the report ID carrying X/Y */
++	struct field btn, x, y, wheel, pan;
++	uint8_t nbtn;
++};
++
++struct hid_if {
++	bool used;
++	uint8_t iface, proto;           /* 1 keyboard, 2 mouse */
++	uint8_t ep, dci;
++	uint16_t mps;
++	uint16_t rdesc_len;             /* from the HID class descriptor */
++	struct ring ring;
++	uint8_t *rep;
++	uint64_t rep_dma;
++	uint8_t last[8];
++	struct mouse_layout ml;
++};
++
++struct dev {
++	bool used;
++	uint8_t slot, port, speed;
++	uint8_t *base;
++	uint64_t base_dma;
++	struct ring ep0;
++	struct hid_if hid[MAX_HID];
++};
++
++struct hc {
++	vm_offset_t regs, op, rt, db;
++	uint8_t *dma;
++	uint64_t dma_pa, dma_size;
++	uint32_t ports, slots, ctxsz, sp;
++	struct ring cmd;
++	struct trb *evt;
++	uint64_t evt_dma;
++	uint32_t evt_deq, ccs;
++	/* completions the waiters look for */
++	bool cmd_done;
++	uint32_t cmd_cc, cmd_slot;
++	bool xfer_done;
++	uint32_t xfer_cc, xfer_slot, xfer_rem;
++	bool rescan;
++	struct dev dev[MAX_DEV];
++	int idx;
++};
++
++static struct hc hcs[MAX_HC];
++static int nhc;
++static uint64_t dma_off;
++static uint32_t xdebug;
++static int scroll_mult = 1;     /* boot-arg xhciscroll=N (negative inverts) */
++
++static inline uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static inline void
++wr64(vm_offset_t base, uint32_t off, uint64_t v)
++{
++	wr32(base, off, (uint32_t)v);
++	wr32(base, off + 4, (uint32_t)(v >> 32));
++}
++
++static inline uint64_t
++dma_of(struct hc *h, const void *p)
++{
++	return h->dma_pa + (uint64_t)((const uint8_t *)p - h->dma) + dma_off;
++}
++
++/* Clean+invalidate a DMA structure (CPU writes out, stale lines dropped). */
++static void
++dsync(struct hc *h, const void *p, size_t len)
++{
++	flush_dcache64((addr64_t)(h->dma_pa + (uint64_t)((const uint8_t *)p - h->dma)), (unsigned)len, TRUE);
++}
++
++static void
++ring_init(struct hc *h, struct ring *r, void *mem, uint32_t n)
++{
++	r->t = mem;
++	r->n = n;
++	r->enq = 0;
++	r->pcs = 1;
++	r->dma = dma_of(h, mem);
++	bzero(mem, n * sizeof(struct trb));
++	struct trb *link = &r->t[n - 1];
++	link->p0 = (uint32_t)r->dma;
++	link->p1 = (uint32_t)(r->dma >> 32);
++	link->ctrl = TRB_TYPE(TRB_LINK) | TRB_TC;       /* cycle 0: not yet owned */
++	dsync(h, mem, n * sizeof(struct trb));
++}
++
++/* Queue one TRB; returns its DMA address. */
++static uint64_t
++ring_put(struct hc *h, struct ring *r, uint32_t p0, uint32_t p1, uint32_t status, uint32_t ctrl)
++{
++	struct trb *t = &r->t[r->enq];
++	uint64_t at = r->dma + (uint64_t)r->enq * sizeof(struct trb);
++	t->p0 = p0;
++	t->p1 = p1;
++	t->status = status;
++	__builtin_arm_dmb(0xb);
++	t->ctrl = (ctrl & ~TRB_C) | r->pcs;
++	dsync(h, t, sizeof(*t));
++	if (++r->enq == r->n - 1) {
++		struct trb *link = &r->t[r->n - 1];
++		__builtin_arm_dmb(0xb);
++		link->ctrl = (link->ctrl & ~TRB_C) | r->pcs;
++		dsync(h, link, sizeof(*link));
++		r->pcs ^= 1;
++		r->enq = 0;
++	}
++	return at;
++}
++
++static void
++doorbell(struct hc *h, uint32_t slot, uint32_t target)
++{
++	__builtin_arm_dsb(0xf);
++	wr32(h->db, 4 * slot, target);
++}
++
++static struct dev *
++dev_by_slot(struct hc *h, uint32_t slot)
++{
++	for (int i = 0; i < MAX_DEV; i++) {
++		if (h->dev[i].used && h->dev[i].slot == slot) {
++			return &h->dev[i];
++		}
++	}
++	return NULL;
++}
++
++static void hid_report(struct hc *h, struct dev *d, struct hid_if *hi, uint32_t len);
++
++/*
++ * Minimal HID report descriptor parser: finds the input fields of a mouse
++ * (Generic Desktop X, Y, Wheel; Consumer AC Pan; Button page) in the report
++ * that carries X. Handles report IDs, usage lists and usage ranges.
++ */
++static void
++parse_mouse(const uint8_t *rd, uint32_t len, struct mouse_layout *ml)
++{
++	uint32_t page = 0, rsize = 0, rcount = 0, rid = 0;
++	uint32_t usages[16], nus = 0, umin = 0, umax = 0;
++	bool range = false;
++	uint16_t pos[16] = { 0 };       /* input bit position per report ID (low 4 bits) */
++	struct {
++		uint8_t rid;
++		struct field f;
++	} btn = { 0, { 0, 0 } }, x = btn, y = btn, wh = btn, pan = btn;
++	uint8_t nbtn = 0;
++
++	bzero(ml, sizeof(*ml));
++	for (uint32_t i = 0; i < len;) {
++		uint8_t b = rd[i];
++		if (b == 0xfe) {                /* long item */
++			if (i + 2 >= len) {
++				break;
++			}
++			i += 3 + rd[i + 1];
++			continue;
++		}
++		uint32_t sz = (b & 3) == 3 ? 4 : (b & 3), v = 0;
++		if (i + 1 + sz > len) {
++			break;
++		}
++		for (uint32_t k = 0; k < sz; k++) {
++			v |= (uint32_t)rd[i + 1 + k] << (8 * k);
++		}
++		i += 1 + sz;
++		switch (b & 0xfc) {
++		case 0x04: page = v; break;                     /* Usage Page */
++		case 0x74: rsize = v; break;                    /* Report Size */
++		case 0x94: rcount = v; break;                   /* Report Count */
++		case 0x84: rid = v; ml->ids = true; break;      /* Report ID */
++		case 0x08:                                      /* Usage */
++			if (nus < 16) {
++				usages[nus++] = sz == 4 ? v : (page << 16 | v);
++			}
++			break;
++		case 0x18: umin = sz == 4 ? v : (page << 16 | v); range = true; break;
++		case 0x28: umax = sz == 4 ? v : (page << 16 | v); range = true; break;
++		case 0x80: {                                    /* Input */
++			uint16_t *p = &pos[rid & 15];
++			if (!(v & 1) && (v & 2)) {              /* data, variable */
++				for (uint32_t f = 0; f < rcount && rsize && rsize <= 32; f++) {
++					uint32_t u = f < nus ? usages[f] :
++					    range ? MIN(umin + f, umax) : (nus ? usages[nus - 1] : 0);
++					struct field fl = { (uint16_t)(*p + f * rsize), (uint8_t)rsize };
++					if (u == 0x10030 && !x.f.size) {
++						x.rid = (uint8_t)rid; x.f = fl;
++					} else if (u == 0x10031 && !y.f.size) {
++						y.rid = (uint8_t)rid; y.f = fl;
++					} else if (u == 0x10038 && !wh.f.size) {
++						wh.rid = (uint8_t)rid; wh.f = fl;
++					} else if (u == 0xc0238 && !pan.f.size) {
++						pan.rid = (uint8_t)rid; pan.f = fl;
++					} else if (u == 0x90001 && !btn.f.size && rsize == 1) {
++						btn.rid = (uint8_t)rid; btn.f = fl;
++						nbtn = (uint8_t)MIN(rcount - f, 8u);
++					}
++				}
++			}
++			*p = (uint16_t)(*p + rsize * rcount);
++		}
++		/* FALLTHROUGH: main items clear the local usages */
++		case 0x90: case 0xb0: case 0xa0: case 0xc0:
++			nus = 0;
++			range = false;
++			break;
++		default:
++			break;
++		}
++	}
++	if (!x.f.size || !y.f.size || x.rid != y.rid) {
++		return;
++	}
++	ml->rid = x.rid;
++	ml->x = x.f;
++	ml->y = y.f;
++	if (btn.f.size && btn.rid == x.rid) {
++		ml->btn = btn.f;
++		ml->nbtn = nbtn;
++	}
++	if (wh.f.size && wh.rid == x.rid) {
++		ml->wheel = wh.f;
++	}
++	if (pan.f.size && pan.rid == x.rid) {
++		ml->pan = pan.f;
++	}
++	ml->valid = true;
++}
++
++/* Signed (or, for buttons, unsigned) bit field of a report. */
++static int32_t
++get_bits(const uint8_t *r, uint32_t rlen, struct field f, bool sign)
++{
++	uint32_t v = 0;
++	if (!f.size || f.off + f.size > rlen * 8) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < f.size; i++) {
++		uint32_t bit = f.off + i;
++		v |= (uint32_t)((r[bit / 8] >> (bit % 8)) & 1) << i;
++	}
++	if (sign && f.size < 32 && (v & (1u << (f.size - 1)))) {
++		v |= ~0u << f.size;
++	}
++	return (int32_t)v;
++}
++
++/* Drain the event ring. */
++static void
++poll_events(struct hc *h)
++{
++	bool any = false;
++	for (;;) {
++		struct trb *e = &h->evt[h->evt_deq];
++		dsync(h, e, sizeof(*e));
++		uint32_t ctrl = e->ctrl;
++		if ((ctrl & TRB_C) != h->ccs) {
++			break;
++		}
++		__builtin_arm_dmb(0xb);
++		uint32_t type = (ctrl >> 10) & 0x3f, cc = e->status >> 24;
++		uint32_t slot = ctrl >> 24;
++		switch (type) {
++		case TRB_EV_CMD:
++			h->cmd_cc = cc;
++			h->cmd_slot = slot;
++			h->cmd_done = true;
++			break;
++		case TRB_EV_TRANSFER: {
++			uint32_t epid = (ctrl >> 16) & 0x1f;
++			struct dev *d = dev_by_slot(h, slot);
++			if (epid == 1) {
++				h->xfer_cc = cc;
++				h->xfer_slot = slot;
++				h->xfer_rem = e->status & 0xffffff;
++				h->xfer_done = true;
++			} else if (d) {
++				for (int i = 0; i < MAX_HID; i++) {
++					struct hid_if *hi = &d->hid[i];
++					if (hi->used && hi->dci == epid) {
++						uint32_t len = hi->mps - MIN(e->status & 0xffffff, hi->mps);
++						if (cc == CC_SUCCESS || cc == CC_SHORT) {
++							hid_report(h, d, hi, len);
++						} else if (xdebug) {
++							printf("SWEET USB: hc%d slot %u ep %u completion %u\n", h->idx, slot, epid, cc);
++						}
++						/* Re-arm (also after an error, so input keeps flowing). */
++						ring_put(h, &hi->ring, (uint32_t)hi->rep_dma, (uint32_t)(hi->rep_dma >> 32),
++						    hi->mps, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
++						doorbell(h, d->slot, hi->dci);
++					}
++				}
++			}
++			break;
++		}
++		case TRB_EV_PORT:
++			h->rescan = true;
++			break;
++		default:
++			break;
++		}
++		any = true;
++		if (++h->evt_deq == EVT_TRBS) {
++			h->evt_deq = 0;
++			h->ccs ^= 1;
++		}
++	}
++	if (any) {
++		wr64(h->rt, IR_ERDP, (h->evt_dma + (uint64_t)h->evt_deq * sizeof(struct trb)) | (1u << 3));
++	}
++}
++
++static int
++wait_flag(struct hc *h, bool *flag, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		poll_events(h);
++		if (*flag) {
++			return 0;
++		}
++		delay(100);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++command(struct hc *h, uint32_t p0, uint32_t p1, uint32_t ctrl, uint32_t *slot_out)
++{
++	h->cmd_done = false;
++	dsync(h, h->dma, D_SP);         /* contexts, DCBAA: written by the CPU just now */
++	ring_put(h, &h->cmd, p0, p1, 0, ctrl);
++	doorbell(h, 0, 0);
++	if (wait_flag(h, &h->cmd_done, 1000)) {
++		printf("SWEET USB: hc%d command type %u timed out\n", h->idx, (ctrl >> 10) & 0x3f);
++		return ETIMEDOUT;
++	}
++	if (h->cmd_cc != CC_SUCCESS) {
++		printf("SWEET USB: hc%d command type %u failed: completion %u\n",
++		    h->idx, (ctrl >> 10) & 0x3f, h->cmd_cc);
++		return EIO;
++	}
++	if (slot_out) {
++		*slot_out = h->cmd_slot;
++	}
++	return 0;
++}
++
++/* Control transfer on EP0; IN data lands in the device's DV_BUF. */
++static int
++control(struct hc *h, struct dev *d, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx,
++    uint16_t len, uint32_t *got)
++{
++	bool in = (rt & 0x80) != 0;
++	uint32_t setup0 = rt | (uint32_t)req << 8 | (uint32_t)val << 16;
++	uint32_t setup1 = idx | (uint32_t)len << 16;
++	uint32_t trt = len ? (in ? 3u : 2u) : 0u;
++	uint64_t buf = d->base_dma + DV_BUF;
++
++	if (len) {
++		dsync(h, d->base + DV_BUF, len);
++	}
++	h->xfer_done = false;
++	ring_put(h, &d->ep0, setup0, setup1, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | trt << 16);
++	if (len) {
++		ring_put(h, &d->ep0, (uint32_t)buf, (uint32_t)(buf >> 32), len,
++		    TRB_TYPE(TRB_DATA) | (in ? 1u << 16 : 0));
++	}
++	ring_put(h, &d->ep0, 0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC | ((len && in) ? 0 : 1u << 16));
++	doorbell(h, d->slot, 1);
++	/*
++	 * Only the status TRB asks for an event; an error (or a short packet) in
++	 * an earlier stage reports one too, and then the status event follows.
++	 */
++	for (int stage = 0; stage < 3; stage++) {
++		if (wait_flag(h, &h->xfer_done, 1000)) {
++			printf("SWEET USB: hc%d slot %u control 0x%02x/0x%02x timed out\n", h->idx, d->slot, rt, req);
++			return ETIMEDOUT;
++		}
++		if (h->xfer_cc == CC_SUCCESS) {
++			break;
++		}
++		if (h->xfer_cc != CC_SHORT) {
++			if (xdebug || req == 6) {
++				printf("SWEET USB: hc%d slot %u control 0x%02x/0x%02x completion %u\n",
++				    h->idx, d->slot, rt, req, h->xfer_cc);
++			}
++			return EIO;
++		}
++		h->xfer_done = false;
++	}
++	if (len) {
++		dsync(h, d->base + DV_BUF, len);        /* drop lines fetched during the transfer */
++	}
++	if (got) {
++		*got = len;
++	}
++	return 0;
++}
++
++static uint32_t *
++ctx(struct hc *h, uint8_t *base, uint32_t index)
++{
++	return (uint32_t *)(base + index * h->ctxsz);
++}
++
++static void
++dev_free(struct hc *h, struct dev *d)
++{
++	if (d->slot) {
++		(void)command(h, 0, 0, TRB_TYPE(TRB_DISABLE_SLOT) | (uint32_t)d->slot << 24, NULL);
++		((uint64_t *)(h->dma + D_DCBAA))[d->slot] = 0;
++	}
++	bzero(d, sizeof(*d));
++}
++
++/* Interval for an interrupt endpoint context (2^n x 125 us). */
++static uint32_t
++ep_interval(uint8_t speed, uint8_t binterval)
++{
++	if (speed >= 3) {               /* high/super speed: bInterval is already 2^(n-1) frames */
++		return MIN(MAX(binterval, 1) - 1u, 15u);
++	}
++	uint32_t uframes = MAX(binterval, 1) * 8u, n = 0;
++	while ((2u << n) <= uframes && n < 10) {
++		n++;
++	}
++	return MAX(n, 3u);
++}
++
++static void
++enumerate(struct hc *h, uint32_t port)
++{
++	uint32_t ps = rd32(h->op, OP_PORTSC(port));
++	if (!(ps & PS_CCS)) {
++		return;
++	}
++	for (int i = 0; i < MAX_DEV; i++) {
++		if (h->dev[i].used && h->dev[i].port == port) {
++			return;
++		}
++	}
++	if (!(ps & PS_PED)) {
++		/* USB 2 port: reset it to enable. */
++		wr32(h->op, OP_PORTSC(port), (ps & PS_KEEP) | PS_PR);
++		for (int i = 0; i < 500 && !(rd32(h->op, OP_PORTSC(port)) & PS_PRC); i++) {
++			delay(1000);
++		}
++		ps = rd32(h->op, OP_PORTSC(port));
++		wr32(h->op, OP_PORTSC(port), (ps & PS_KEEP) | PS_PRC);
++		IOSleep(20);
++		ps = rd32(h->op, OP_PORTSC(port));
++		if (!(ps & PS_PED)) {
++			printf("SWEET USB: hc%d port %u did not enable (portsc 0x%x)\n", h->idx, port, ps);
++			return;
++		}
++	}
++	uint8_t speed = (ps >> 10) & 0xf;
++	int di = -1;
++	for (int i = 0; i < MAX_DEV; i++) {
++		if (!h->dev[i].used) {
++			di = i;
++			break;
++		}
++	}
++	if (di < 0) {
++		return;
++	}
++	struct dev *d = &h->dev[di];
++	bzero(d, sizeof(*d));
++	d->used = true;
++	d->port = (uint8_t)port;
++	d->speed = speed;
++	d->base = h->dma + D_DEV(di);
++	d->base_dma = dma_of(h, d->base);
++	bzero(d->base, 0x3000);
++
++	uint32_t slot;
++	if (command(h, 0, 0, TRB_TYPE(TRB_ENABLE_SLOT), &slot) || slot == 0 || slot > h->slots) {
++		d->used = false;
++		return;
++	}
++	d->slot = (uint8_t)slot;
++	((uint64_t *)(h->dma + D_DCBAA))[slot] = d->base_dma + DV_OUT;
++	ring_init(h, &d->ep0, d->base + DV_EP0, EP0_TRBS);
++
++	/* Input context: A0 (slot) + A1 (EP0). */
++	uint8_t *in = d->base + DV_IN;
++	uint32_t mps0 = speed == 2 ? 8 : speed == 1 ? 8 : speed == 3 ? 64 : 512;
++	ctx(h, in, 0)[1] = 0x3;
++	uint32_t *sc = ctx(h, in, 1);
++	sc[0] = (1u << 27) | ((uint32_t)speed << 20);
++	sc[1] = port << 16;
++	uint32_t *e0 = ctx(h, in, 2);
++	e0[1] = (3u << 1) | (4u << 3) | (mps0 << 16);
++	e0[2] = (uint32_t)d->ep0.dma | 1;
++	e0[3] = (uint32_t)(d->ep0.dma >> 32);
++	e0[4] = 8;
++	uint64_t in_dma = d->base_dma + DV_IN;
++	if (command(h, (uint32_t)in_dma, (uint32_t)(in_dma >> 32), TRB_TYPE(TRB_ADDRESS_DEV) | slot << 24, NULL)) {
++		dev_free(h, d);
++		return;
++	}
++	IOSleep(10);
++
++	uint8_t *buf = d->base + DV_BUF;
++	uint32_t got = 0;
++	if (control(h, d, 0x80, 6, 0x0100, 0, 8, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	if (buf[7] && buf[7] != mps0) {
++		mps0 = buf[7] == 9 ? 512 : buf[7];
++		ctx(h, in, 0)[1] = 0x2;
++		e0[1] = (3u << 1) | (4u << 3) | (mps0 << 16);
++		(void)command(h, (uint32_t)in_dma, (uint32_t)(in_dma >> 32), TRB_TYPE(TRB_EVAL_CTX) | slot << 24, NULL);
++	}
++	got = 0;
++	if (control(h, d, 0x80, 6, 0x0100, 0, 18, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	uint16_t vid = (uint16_t)(buf[8] | buf[9] << 8), pid = (uint16_t)(buf[10] | buf[11] << 8);
++	uint8_t dclass = buf[4];
++	printf("SWEET USB: hc%d port %u: device %04x:%04x class %u speed %u slot %u mps0 %u\n",
++	    h->idx, port, vid, pid, dclass, speed, slot, mps0);
++	if (dclass == 9) {
++		printf("SWEET USB: hubs are not supported yet: plug the keyboard/mouse in directly\n");
++		dev_free(h, d);
++		return;
++	}
++	got = 0;
++	if (control(h, d, 0x80, 6, 0x0200, 0, 9, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	uint16_t total = (uint16_t)MIN((uint32_t)(buf[2] | buf[3] << 8), 1024u);
++	uint8_t cfgval = buf[5];
++	got = 0;
++	if (control(h, d, 0x80, 6, 0x0200, 0, total, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	/* Parse: HID boot interfaces and their interrupt IN endpoint. */
++	int nh = 0, cur = -1;
++	uint8_t cfg[1024];
++	memcpy(cfg, buf, total);
++	for (uint32_t off = 0; off + 2 <= total && cfg[off] >= 2; off += cfg[off]) {
++		const uint8_t *x = &cfg[off];
++		if (x[1] == 4 && x[0] >= 9) {           /* interface */
++			cur = -1;
++			/* HID keyboard/mouse, boot subclass or not (many 2.4 GHz dongles omit it). */
++			if (x[5] == 3 && (x[7] == 1 || x[7] == 2) && nh < MAX_HID) {
++				cur = nh++;
++				d->hid[cur].iface = x[2];
++				d->hid[cur].proto = x[7];
++			}
++			if (xdebug) {
++				printf("SWEET USB: interface %u class %u/%u/%u%s\n", x[2], x[5], x[6], x[7],
++				    cur >= 0 ? " (used)" : "");
++			}
++		} else if (x[1] == 0x21 && x[0] >= 9 && cur >= 0 && x[6] == 0x22) {
++			d->hid[cur].rdesc_len = (uint16_t)(x[7] | x[8] << 8);   /* HID: report descriptor size */
++		} else if (x[1] == 5 && x[0] >= 7 && cur >= 0 && !d->hid[cur].used) {
++			if ((x[2] & 0x80) && (x[3] & 3) == 3) {     /* interrupt IN */
++				struct hid_if *hi = &d->hid[cur];
++				hi->ep = x[2] & 0xf;
++				hi->dci = (uint8_t)(2 * hi->ep + 1);
++				hi->mps = (uint16_t)MIN((uint32_t)(x[4] | (x[5] & 7) << 8), 64u);
++				hi->used = true;
++				uint8_t interval = (uint8_t)ep_interval(speed, x[6]);
++				hi->rep = d->base + DV_REP(cur);
++				hi->rep_dma = d->base_dma + DV_REP(cur);
++				ring_init(h, &hi->ring, d->base + DV_INT(cur), INT_TRBS);
++				uint32_t *ec = ctx(h, in, 1 + hi->dci);
++				bzero(ec, h->ctxsz);
++				ec[0] = (uint32_t)interval << 16;
++				ec[1] = (3u << 1) | (7u << 3) | ((uint32_t)hi->mps << 16);
++				ec[2] = (uint32_t)hi->ring.dma | 1;
++				ec[3] = (uint32_t)(hi->ring.dma >> 32);
++				ec[4] = 8 | ((uint32_t)hi->mps << 16);
++			}
++		}
++	}
++	uint32_t add = 1, maxdci = 1;
++	for (int i = 0; i < MAX_HID; i++) {
++		if (d->hid[i].used) {
++			add |= 1u << d->hid[i].dci;
++			maxdci = MAX(maxdci, d->hid[i].dci);
++		}
++	}
++	if (add == 1) {
++		printf("SWEET USB: hc%d port %u: no HID keyboard/mouse interface\n", h->idx, port);
++		/* Keep the slot so the port is not re-enumerated until unplugged. */
++		return;
++	}
++	if (control(h, d, 0x00, 9, cfgval, 0, 0, NULL)) {
++		dev_free(h, d);
++		return;
++	}
++	ctx(h, in, 0)[0] = 0;
++	ctx(h, in, 0)[1] = add;
++	sc[0] = (sc[0] & ~(0x1fu << 27)) | (maxdci << 27);
++	if (command(h, (uint32_t)in_dma, (uint32_t)(in_dma >> 32), TRB_TYPE(TRB_CONFIG_EP) | slot << 24, NULL)) {
++		dev_free(h, d);
++		return;
++	}
++	for (int i = 0; i < MAX_HID; i++) {
++		struct hid_if *hi = &d->hid[i];
++		if (!hi->used) {
++			continue;
++		}
++		if (hi->proto == 2) {
++			/* Mice: report protocol with the device's own layout (wheel included). */
++			uint16_t rl = (uint16_t)MIN(hi->rdesc_len ? hi->rdesc_len : 512u, 1024u);
++			uint32_t got = 0;
++			if (control(h, d, 0x81, 6, 0x2200, hi->iface, rl, &got) == 0) {
++				parse_mouse(d->base + DV_BUF, rl, &hi->ml);
++			}
++			if (hi->ml.valid) {
++				(void)control(h, d, 0x21, 0x0b, 1, hi->iface, 0, NULL); /* SET_PROTOCOL report */
++				printf("SWEET USB: mouse layout: id %u, buttons %u@%u, x %u@%u, y %u@%u, wheel %u@%u, pan %u@%u\n",
++				    hi->ml.ids ? hi->ml.rid : 0, hi->ml.nbtn, hi->ml.btn.off, hi->ml.x.size, hi->ml.x.off,
++				    hi->ml.y.size, hi->ml.y.off, hi->ml.wheel.size, hi->ml.wheel.off,
++				    hi->ml.pan.size, hi->ml.pan.off);
++			} else {
++				printf("SWEET USB: mouse report descriptor not understood: boot protocol (no wheel)\n");
++				(void)control(h, d, 0x21, 0x0b, 0, hi->iface, 0, NULL);
++			}
++		} else {
++			(void)control(h, d, 0x21, 0x0b, 0, hi->iface, 0, NULL);        /* SET_PROTOCOL boot */
++			(void)control(h, d, 0x21, 0x0a, 0, hi->iface, 0, NULL);        /* SET_IDLE 0 */
++		}
++		ring_put(h, &hi->ring, (uint32_t)hi->rep_dma, (uint32_t)(hi->rep_dma >> 32), hi->mps,
++		    TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
++		doorbell(h, d->slot, hi->dci);
++		printf("SWEET USB: hc%d port %u: %s on interface %u, endpoint %u\n", h->idx, port,
++		    hi->proto == 1 ? "keyboard" : "mouse", hi->iface, hi->ep);
++	}
++}
++
++/* Keyboard usages that act as iPad buttons instead of keys. */
++static bool
++kbd_special(uint8_t usage, int down)
++{
++	switch (usage) {
++	case 0x29:      /* Esc: Home (every keyboard has one) */
++	case 0x3a:      /* F1 (Back on Chromebook-style keyboards): Home */
++		sweet_hid_key(3, down);
++		return true;
++	case 0x3b:      /* F2: side button (lock) */
++		sweet_hid_key(0, down);
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool
++contains(const uint8_t *keys, uint8_t k)
++{
++	for (int i = 0; i < 6; i++) {
++		if (keys[i] == k) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++hid_report(struct hc *h, struct dev *d, struct hid_if *hi, uint32_t len)
++{
++	uint8_t r[8] = { 0 };
++	dsync(h, hi->rep, 64);
++	memcpy(r, hi->rep, MIN(len, 8u));
++	if (xdebug) {
++		printf("SWEET USB: hc%d slot %u %s report %u: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    h->idx, d->slot, hi->proto == 1 ? "kbd" : "mouse", len,
++		    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
++	}
++	if (hi->proto == 1) {
++		if (len < 3 || r[2] == 1) {     /* phantom state (rollover) */
++			return;
++		}
++		uint8_t mods = r[0], old = hi->last[0];
++		for (int b = 0; b < 8; b++) {
++			if ((mods ^ old) & (1u << b)) {
++				sweet_hid_kbd(7, 0xe0 + b, (mods >> b) & 1);
++			}
++		}
++		for (int i = 2; i < 8; i++) {   /* released */
++			uint8_t k = hi->last[i];
++			if (k > 3 && !contains(&r[2], k) && !kbd_special(k, 0)) {
++				sweet_hid_kbd(7, k, 0);
++			}
++		}
++		for (int i = 2; i < 8; i++) {   /* pressed */
++			uint8_t k = r[i];
++			if (k > 3 && !contains(&hi->last[2], k) && !kbd_special(k, 1)) {
++				sweet_hid_kbd(7, k, 1);
++			}
++		}
++		memcpy(hi->last, r, 8);
++	} else if (hi->ml.valid) {
++		const uint8_t *p = hi->rep;
++		uint32_t n = MIN(len, (uint32_t)hi->mps);
++		if (hi->ml.ids) {
++			if (n < 1 || p[0] != hi->ml.rid) {
++				return;                 /* another report of this device */
++			}
++			p++;
++			n--;
++		}
++		uint32_t buttons = hi->ml.nbtn ? (uint32_t)get_bits(p, n,
++		    (struct field){ hi->ml.btn.off, hi->ml.nbtn }, false) & 7 : 0;
++		int dx = get_bits(p, n, hi->ml.x, true), dy = get_bits(p, n, hi->ml.y, true);
++		int wheel = get_bits(p, n, hi->ml.wheel, true), pan = get_bits(p, n, hi->ml.pan, true);
++		sweet_hid_pointer(dx, dy, buttons, wheel * scroll_mult, pan * scroll_mult);
++	} else {
++		if (len < 3) {
++			return;
++		}
++		sweet_hid_pointer((int8_t)r[1], (int8_t)r[2], r[0] & 7, 0, 0);
++	}
++}
++
++static int
++hc_init(struct hc *h, uint64_t pa, uint64_t size)
++{
++	h->regs = ml_io_map(pa, size);
++	uint32_t ver = rd32(h->regs, CAP_LENGTH);
++	uint32_t gctl = rd32(h->regs, DWC3_GCTL);
++	printf("SWEET USB: hc%d at 0x%llx: caplength/version 0x%08x, DWC3 GCTL 0x%08x\n", h->idx, pa, ver, gctl);
++	if (ver == 0xffffffff || ((ver >> 16) != 0x100 && (ver >> 16) != 0x110 && (ver >> 16) != 0x120)) {
++		printf("SWEET USB: hc%d: no xHCI here\n", h->idx);
++		return ENXIO;
++	}
++	if (((gctl >> 12) & 3) != 1) {
++		wr32(h->regs, DWC3_GCTL, (gctl & ~(3u << 12)) | (1u << 12));
++		IOSleep(10);
++		printf("SWEET USB: hc%d: DWC3 switched to host mode (GCTL 0x%08x)\n", h->idx, rd32(h->regs, DWC3_GCTL));
++	}
++	h->op = h->regs + (ver & 0xff);
++	h->rt = h->regs + (rd32(h->regs, CAP_RTSOFF) & ~0x1fu);
++	h->db = h->regs + (rd32(h->regs, CAP_DBOFF) & ~0x3u);
++	uint32_t p1 = rd32(h->regs, CAP_HCSPARAMS1), p2 = rd32(h->regs, CAP_HCSPARAMS2);
++	uint32_t c1 = rd32(h->regs, CAP_HCCPARAMS1);
++	h->slots = MIN(p1 & 0xff, 64u);
++	h->ports = p1 >> 24;
++	h->ctxsz = (c1 & (1u << 2)) ? 64 : 32;
++	h->sp = ((p2 >> 21) & 0x1f) << 5 | (p2 >> 27);
++	if (!(c1 & 1)) {
++		printf("SWEET USB: hc%d has no 64-bit addressing\n", h->idx);
++		return ENXIO;
++	}
++
++	/* Halt and reset. */
++	wr32(h->op, OP_USBCMD, rd32(h->op, OP_USBCMD) & ~CMD_RS);
++	for (int i = 0; i < 200 && !(rd32(h->op, OP_USBSTS) & STS_HCH); i++) {
++		delay(1000);
++	}
++	wr32(h->op, OP_USBCMD, CMD_HCRST);
++	for (int i = 0; i < 1000 && (rd32(h->op, OP_USBCMD) & CMD_HCRST); i++) {
++		delay(1000);
++	}
++	for (int i = 0; i < 1000 && (rd32(h->op, OP_USBSTS) & STS_CNR); i++) {
++		delay(1000);
++	}
++	if (rd32(h->op, OP_USBSTS) & STS_CNR) {
++		printf("SWEET USB: hc%d not ready after reset (sts 0x%x)\n", h->idx, rd32(h->op, OP_USBSTS));
++		return EIO;
++	}
++
++	/* DMA memory: one contiguous block, used through a write-combined mapping. */
++	uint32_t pagesz = (rd32(h->op, OP_PAGESIZE) & 0xffff) << 12;
++	if (pagesz != 4096 && h->sp) {
++		printf("SWEET USB: hc%d page size %u unsupported\n", h->idx, pagesz);
++		return ENXIO;
++	}
++	h->dma_size = round_page_64(D_SP + (uint64_t)h->sp * 4096);
++	vm_offset_t va;
++	if (kmem_alloc_contig(kernel_map, &va, (vm_size_t)h->dma_size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		return ENOMEM;
++	}
++	h->dma_pa = ptoa_64(pn);
++	h->dma = (uint8_t *)va;
++	bzero(h->dma, (size_t)h->dma_size);
++
++	uint64_t *dcbaa = (uint64_t *)(h->dma + D_DCBAA);
++	if (h->sp) {
++		uint64_t *arr = (uint64_t *)(h->dma + D_SPARR);
++		for (uint32_t i = 0; i < h->sp; i++) {
++			arr[i] = dma_of(h, h->dma + D_SP + i * 4096);
++		}
++		dcbaa[0] = dma_of(h, arr);
++	}
++	wr32(h->op, OP_CONFIG, h->slots);
++	wr64(h->op, OP_DCBAAP, dma_of(h, dcbaa));
++	ring_init(h, &h->cmd, h->dma + D_CMD, CMD_TRBS);
++	wr64(h->op, OP_CRCR, h->cmd.dma | 1);
++	h->evt = (struct trb *)(h->dma + D_EVT);
++	h->evt_dma = dma_of(h, h->evt);
++	h->evt_deq = 0;
++	h->ccs = 1;
++	uint64_t *erst = (uint64_t *)(h->dma + D_ERST);
++	erst[0] = h->evt_dma;
++	erst[1] = EVT_TRBS;
++	dsync(h, h->dma, (size_t)h->dma_size);
++	wr32(h->rt, IR_IMAN, 0);
++	wr32(h->rt, IR_ERSTSZ, 1);
++	wr64(h->rt, IR_ERDP, h->evt_dma);
++	wr64(h->rt, IR_ERSTBA, dma_of(h, erst));
++	__builtin_arm_dsb(0xf);
++	wr32(h->op, OP_USBCMD, CMD_RS);
++	for (int i = 0; i < 100 && (rd32(h->op, OP_USBSTS) & STS_HCH); i++) {
++		delay(1000);
++	}
++	/* Port power (no-op where ports are always powered). */
++	for (uint32_t p = 1; p <= h->ports; p++) {
++		uint32_t ps = rd32(h->op, OP_PORTSC(p));
++		if (!(ps & PS_PP)) {
++			wr32(h->op, OP_PORTSC(p), (ps & PS_KEEP) | PS_PP);
++		}
++	}
++	printf("SWEET USB: hc%d running: %u ports, %u slots, %u-byte contexts, %u scratchpad pages, DMA 0x%llx (+0x%llx)\n",
++	    h->idx, h->ports, h->slots, h->ctxsz, h->sp, h->dma_pa, dma_off);
++	return 0;
++}
++
++static void
++scan(struct hc *h)
++{
++	h->rescan = false;
++	for (uint32_t p = 1; p <= h->ports; p++) {
++		uint32_t ps = rd32(h->op, OP_PORTSC(p));
++		if (ps & PS_CHANGES) {
++			wr32(h->op, OP_PORTSC(p), (ps & PS_KEEP) | (ps & PS_CHANGES));
++		}
++		if (!(ps & PS_CCS)) {
++			for (int i = 0; i < MAX_DEV; i++) {
++				if (h->dev[i].used && h->dev[i].port == p) {
++					printf("SWEET USB: hc%d port %u: device removed\n", h->idx, p);
++					dev_free(h, &h->dev[i]);
++				}
++			}
++			continue;
++		}
++		enumerate(h, p);
++	}
++}
++
++/*
++ * The Pi 5 power button (firmware DT /pwr_button: brcmstb GPIO 20 at
++ * 0x107d508500, active low; ADT /sweet-xhci power-button = the bank's DATA
++ * register, power-button-bit = 20) acts as the iPad side button. Holding it
++ * still powers the board off in hardware.
++ */
++static vm_offset_t pwr_reg;
++static uint32_t pwr_bit;
++
++static void
++poll_power_button(void)
++{
++	static bool state, cand;
++	static uint32_t stable;
++	if (!pwr_reg) {
++		return;
++	}
++	bool pressed = !(*(volatile uint32_t *)pwr_reg & (1u << pwr_bit));
++	if (pressed != cand) {
++		cand = pressed;
++		stable = 0;
++	} else if (cand != state && ++stable >= 10) {   /* ~40 ms debounce */
++		state = cand;
++		sweet_hid_key(0, state);
++		if (xdebug) {
++			printf("SWEET USB: power button %s\n", state ? "down" : "up");
++		}
++	}
++}
++
++static void
++sweet_xhci_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	IOSleep(2000);          /* power-on settle; the HID services register meanwhile */
++	for (int i = 0; i < nhc; i++) {
++		scan(&hcs[i]);
++	}
++	for (uint32_t tick = 0;; tick++) {
++		poll_power_button();
++		for (int i = 0; i < nhc; i++) {
++			struct hc *h = &hcs[i];
++			poll_events(h);
++			/* Hotplug: port change events, plus a slow fallback scan. */
++			if (h->rescan || (tick % 250) == 0) {
++				IOSleep(h->rescan ? 100 : 0);
++				scan(h);
++			}
++		}
++		IOSleep(4);
++	}
++}
++
++/*
++ * BCM2712 PCIe x4 root complex (brcmstb) and RP1 behind it. What the firmware
++ * leaves with pciex4_reset=0 (measured on the Pi, 2026-11-08): link up,
++ * outbound window 0 = CPU 0x1c00000000 -> PCI 0x80000000 (1 GiB), root port
++ * memory window PCI 0x80000000-0xbfffffff, but the root port's bus numbers
++ * all 0 (so config reads of RP1 fail) and inbound BAR2 = PCI 0 (64 GiB).
++ * Here: give the root port bus 1, read (or assign) RP1's BAR1 inside the
++ * outbound window, turn on memory decode + bus mastering, and move inbound
++ * BAR2 to PCI 0x10_0000_0000 (RP1's DMA masters reach host memory there).
++ * Returns the CPU address of RP1 BAR1 (its 0xc0_40000000 peripheral space),
++ * or 0.
++ */
++#define RC_WIN0_LO              0x400c
++#define RC_WIN0_HI              0x4010
++#define RC_BAR2_LO              0x4034
++#define RC_BAR2_HI              0x4038
++#define RC_STATUS               0x4068
++#define RC_WIN0_BASE_LIMIT      0x4070
++#define RC_WIN0_BASE_HI         0x4080
++#define RC_WIN0_LIMIT_HI        0x4084
++#define RC_UBUS_REMAP_LO        0x40b4
++#define RC_UBUS_REMAP_HI        0x40b8
++#define RC_EXT_CFG_DATA         0x8000
++#define RC_EXT_CFG_INDEX        0x9000
++
++static vm_offset_t rc;
++
++static uint32_t
++rp1_cfg_rd(uint32_t off)
++{
++	wr32(rc, RC_EXT_CFG_INDEX, 1u << 20);   /* bus 1, device 0, function 0 */
++	return rd32(rc, RC_EXT_CFG_DATA + off);
++}
++
++static void
++rp1_cfg_wr(uint32_t off, uint32_t v)
++{
++	wr32(rc, RC_EXT_CFG_INDEX, 1u << 20);
++	wr32(rc, RC_EXT_CFG_DATA + off, v);
++}
++
++static void
++rp1_dump(const char *when)
++{
++	printf("SWEET USB: PCIe %s: RC id 0x%08x cmd 0x%08x bus 0x%08x memwin 0x%08x | win0 pci 0x%08x%08x"
++	    " base/limit 0x%08x hi 0x%x/0x%x | rc bar2 0x%08x%08x remap 0x%08x%08x\n", when,
++	    rd32(rc, 0x00), rd32(rc, 0x04), rd32(rc, 0x18), rd32(rc, 0x20),
++	    rd32(rc, RC_WIN0_HI), rd32(rc, RC_WIN0_LO), rd32(rc, RC_WIN0_BASE_LIMIT),
++	    rd32(rc, RC_WIN0_BASE_HI), rd32(rc, RC_WIN0_LIMIT_HI),
++	    rd32(rc, RC_BAR2_HI), rd32(rc, RC_BAR2_LO),
++	    rd32(rc, RC_UBUS_REMAP_HI), rd32(rc, RC_UBUS_REMAP_LO));
++	printf("SWEET USB: RP1 %s: id 0x%08x cmd 0x%08x bar0 0x%08x bar1 0x%08x bar2 0x%08x\n", when,
++	    rp1_cfg_rd(0x00), rp1_cfg_rd(0x04), rp1_cfg_rd(0x10), rp1_cfg_rd(0x14), rp1_cfg_rd(0x18));
++}
++
++static uint64_t
++rp1_setup(uint64_t rc_pa)
++{
++	rc = ml_io_map(rc_pa, 0xa000);
++	rp1_dump("as found");
++	if ((rd32(rc, 0x18) & 0x0000ff00u) == 0) {
++		wr32(rc, 0x18, (rd32(rc, 0x18) & 0xff000000u) | 0x00010100u);
++		__builtin_arm_dsb(0xf);
++	}
++	uint32_t id = rp1_cfg_rd(0x00);
++	if (id == 0xffffffff || id == 0xdeaddead || id == 0) {
++		printf("SWEET USB: RP1 does not answer config reads (0x%08x)\n", id);
++		return 0;
++	}
++	/* Outbound window 0 as programmed. */
++	uint32_t bl = rd32(rc, RC_WIN0_BASE_LIMIT);
++	uint64_t pci = (uint64_t)rd32(rc, RC_WIN0_HI) << 32 | rd32(rc, RC_WIN0_LO);
++	uint64_t cpu_mb = (uint64_t)rd32(rc, RC_WIN0_BASE_HI) << 12 | ((bl >> 4) & 0xfff);
++	uint64_t lim_mb = (uint64_t)rd32(rc, RC_WIN0_LIMIT_HI) << 12 | (bl >> 20);
++	if (bl == 0 || lim_mb < cpu_mb) {
++		printf("SWEET USB: no outbound PCIe window\n");
++		return 0;
++	}
++	uint64_t cpu = cpu_mb << 20, len = (lim_mb - cpu_mb + 1) << 20;
++	uint32_t cmd = rp1_cfg_rd(0x04);
++	uint64_t bar1 = rp1_cfg_rd(0x14) & ~0xfull;
++	if (bar1 < pci || bar1 + 0x400000 > pci + len) {
++		/* Unassigned (or outside the window): lay RP1 out at the window start. */
++		rp1_cfg_wr(0x04, cmd & ~0x6u);
++		rp1_cfg_wr(0x14, (uint32_t)pci);
++		rp1_cfg_wr(0x18, (uint32_t)pci + 0x400000u);
++		rp1_cfg_wr(0x10, (uint32_t)pci + 0x410000u);
++		bar1 = pci;
++		printf("SWEET USB: RP1 BARs assigned at PCI 0x%llx\n", pci);
++	}
++	rp1_cfg_wr(0x04, rp1_cfg_rd(0x04) | 0x6);       /* memory decode + bus master */
++	wr32(rc, 0x04, rd32(rc, 0x04) | 0x6);
++	/* Inbound: PCI 0x10_0000_0000 -> host memory (size encoding kept). */
++	if (rd32(rc, RC_BAR2_HI) != (uint32_t)(dma_off >> 32)) {
++		wr32(rc, RC_BAR2_LO, (rd32(rc, RC_BAR2_LO) & 0x1f) | (uint32_t)dma_off);
++		wr32(rc, RC_BAR2_HI, (uint32_t)(dma_off >> 32));
++	}
++	__builtin_arm_dsb(0xf);
++	IOSleep(5);
++	rp1_dump("after setup");
++	uint64_t base = cpu + (bar1 - pci);
++	vm_offset_t probe = ml_io_map(base + 0x200000, PAGE_SIZE);
++	printf("SWEET USB: RP1 at CPU 0x%llx (PCI 0x%llx); xHCI 0 reads 0x%08x\n", base, bar1, rd32(probe, 0));
++	return base;
++}
++
++void sweet_xhci_start(void);
++
++static void usb_setup(DTEntry node, uint64_t const *reg, unsigned int size);
++
++void
++sweet_xhci_start(void)
++{
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	unsigned int size = 0;
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("xhci", &on, sizeof(on));
++	PE_parse_boot_argn("xhcidebug", &xdebug, sizeof(xdebug));
++	PE_parse_boot_argn("xhciscroll", &scroll_mult, sizeof(scroll_mult));
++	if (SecureDTLookupEntry(NULL, "/sweet-xhci", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return;
++	}
++	uint64_t const *pb = NULL;
++	uint32_t const *bit = NULL;
++	unsigned int pbsz = 0, bitsz = 0;
++	if (SecureDTGetProperty(node, "power-button", (void const **)&pb, &pbsz) == kSuccess && pbsz >= 8 &&
++	    SecureDTGetProperty(node, "power-button-bit", (void const **)&bit, &bitsz) == kSuccess && bitsz >= 4) {
++		pwr_reg = ml_io_map(pb[0] & ~(uint64_t)PAGE_MASK, PAGE_SIZE) + (pb[0] & PAGE_MASK);
++		pwr_bit = bit[0] & 31;
++		printf("SWEET USB: power button on GPIO bit %u (%s)\n", pwr_bit,
++		    (*(volatile uint32_t *)pwr_reg & (1u << pwr_bit)) ? "up" : "DOWN?");
++	}
++	if (on) {
++		usb_setup(node, reg, size);
++	}
++	if ((nhc || pwr_reg) && kernel_thread_start(sweet_xhci_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++static void
++usb_setup(DTEntry node, uint64_t const *reg, unsigned int size)
++{
++	uint64_t const *p = NULL;
++	unsigned int psz = 0;
++	uint64_t rp1 = 0;
++	if (SecureDTGetProperty(node, "dma-offset", (void const **)&p, &psz) == kSuccess && psz >= 8) {
++		dma_off = p[0];
++	}
++	PE_parse_boot_argn("xhcidma", &dma_off, sizeof(dma_off));
++	/* RP1 sits behind the PCIe x4 root complex: touch it only with the link up. */
++	if (SecureDTGetProperty(node, "pcie-status", (void const **)&p, &psz) == kSuccess && psz >= 8) {
++		vm_offset_t st = ml_io_map(p[0] & ~(uint64_t)PAGE_MASK, PAGE_SIZE) + (p[0] & PAGE_MASK);
++		uint32_t v = *(volatile uint32_t *)st;
++		printf("SWEET USB: PCIe x4 status 0x%08x\n", v);
++		if ((v & 0x30) != 0x30) {
++			printf("SWEET USB: RP1 PCIe link is down (config.txt pciex4_reset=0?): no USB\n");
++			return;
++		}
++		rp1 = rp1_setup(p[0] - RC_STATUS);
++		if (!rp1) {
++			return;
++		}
++	}
++	for (unsigned i = 0; i + 1 < size / 8 && nhc < MAX_HC; i += 2) {
++		struct hc *h = &hcs[nhc];
++		h->idx = nhc;
++		/* reg is laid out for RP1 BAR1 at CPU 0x1f00000000 (Linux): rebase. */
++		uint64_t pa = rp1 ? rp1 + (reg[i] - 0x1f00000000ull) : reg[i];
++		if (hc_init(h, pa, reg[i + 1]) == 0) {
++			nhc++;
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 7a32a23..46a0bcc 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1366,6 +1366,20 @@ PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+ 	if (gIOPlatform) {
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: no RTC driver. boot-arg sweettime=<Unix seconds> (stamped by
++	 * tools/mkpayload.py when the payload is built) seeds the calendar
++	 * instead of 1970.
++	 */
++	if (*secs == 0) {
++		uint64_t t = 0;
++		if (PE_parse_boot_argn("sweettime", &t, sizeof(t)) && t) {
++			*secs = (clock_sec_t)t;
++			nsecs = 0;
++		}
++	}
++#endif
+ 
+ 	assert(nsecs < NSEC_PER_SEC);
+ 	*usecs = nsecs / NSEC_PER_USEC;
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..f16af1b 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,39 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if SWEET_GICV2
++extern "C" void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++extern "C" uint32_t sweet_gic_sgi_rx(unsigned int cpu);
++extern "C" uint32_t sweet_gic_cpu_mask(unsigned int cpu);
++extern "C" uint32_t sweet_gic_timer_rx(unsigned int cpu);
++extern "C" uint32_t sweet_gic_igroupr0(unsigned int cpu);
++extern "C" uint32_t sweet_vtimer_intid;
++extern "C" processor_t thread_bind(processor_t processor);
++extern "C" wait_result_t thread_block(thread_continue_t continuation);
++
++/*
++ * Real Pi 5: cpus=1 boots to the root-device wait, cpus=4 hangs right after
++ * "ifnet_attach ... lo0 ... Proceeding". The SGI1 check in startAll only
++ * proves each CPU can signal itself. Signal every CPU from this thread and
++ * report whether its sleh_irq saw it, without hanging if one is lost.
++ */
++static void
++sweet_ipi_matrix(unsigned int ncpus)
++{
++	for (unsigned int t = 0; t < ncpus; t++) {
++		unsigned int src = cpu_number();
++		uint32_t before = sweet_gic_sgi_rx(t);
++		sweet_gic_send_sgi(t, SWEET_IPI_SGI);
++		uint64_t deadline;
++		nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &deadline);
++		while (sweet_gic_sgi_rx(t) == before && mach_absolute_time() < deadline) {
++			;
++		}
++		IOLog("SWEET IPI: cpu %u -> cpu %u (mask 0x%x): %s\n", src, t,
++		    sweet_gic_cpu_mask(t), sweet_gic_sgi_rx(t) != before ? "OK" : "LOST");
++	}
++}
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -73,16 +106,21 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if SWEET_BOARD_PI5
++	/* Pi 5: MPIDR Aff1 = core, 0x000-0x300. QEMU virt: Aff0 = core, 0x0-0x3. */
++	bool bad_mpidr = (cpu->phys_id & 0xff) == 0 ? cpu->phys_id > 0x300 : cpu->phys_id > 0x3;
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	bool bad_mpidr = cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0;
++#endif
++	if (bad_mpidr || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy(SWEET_BOARD_PI5 ? "Cortex-A76" : "Kryo 470");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -175,6 +213,31 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++#if SWEET_GICV2
++	sweet_ipi_matrix(topology->num_cpus);
++	/*
++	 * Real Pi 5: IPIs all OK, cpus=4 still hangs after lo0. Check each CPU's
++	 * own timer interrupt: move this thread onto the CPU and sleep 5 ms there,
++	 * which only that CPU's timer IRQ (PPI sweet_vtimer_intid) can end. If it
++	 * is dead, the boot stops right after "testing cpu N". IGROUPR0 bit for
++	 * the timer must be Group 1 to reach us from the non-secure side.
++	 */
++	for (unsigned int i = 0; i < topology->num_cpus; i++) {
++		SweetCPU *c = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		uint32_t grp = sweet_gic_igroupr0(i);
++		IOLog("SWEET TMR: testing cpu %u: IGROUPR0 0x%08x, timer PPI %s\n", i, grp,
++		    ((grp >> sweet_vtimer_intid) & 1) ? "Group 1" : "Group 0 (secure!)");
++		thread_bind(c->machProcessor);
++		thread_block(THREAD_CONTINUE_NULL);
++		unsigned int on = cpu_number();
++		uint32_t before = sweet_gic_timer_rx(on);
++		IOSleep(5);
++		IOLog("SWEET TMR: cpu %u woke from a 5 ms sleep, +%u timer IRQs%s\n", on,
++		    sweet_gic_timer_rx(on) - before, on == i ? "" : " (NOT on the bound CPU)");
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++#endif
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -214,6 +277,11 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("SWEET CPU: invalid SGI target %u", logical);
+ 	}
++#if SWEET_GICV2
++	/* Pi 5 GIC-400: GICD_SGIR with the target's CPU-interface mask (pe_fiq.c). */
++	sweet_gic_send_sgi(logical, SWEET_IPI_SGI);
++	return;
++#endif
+ 	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+ 	uint64_t mpidr = topology->cpus[logical].phys_id;
+ 	unsigned int aff0 = mpidr & 0xff;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..f5cf20d 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -559,3 +559,117 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * External USB keyboard and mouse (Pi 5: bsd/dev/sweet_xhci.c), presented
++ * the way IOHIDFamily's IOHIDEventDriver presents USB HID devices: a
++ * Generic Desktop Keyboard service sending keyboard-page key events, and a
++ * Generic Desktop Mouse service sending relative pointer and scroll events
++ * (iPadOS draws its own pointer for it).
++ */
++class SweetHIDKeyboard : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDKeyboard);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void key(UInt32 page, UInt32 usage, bool down);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Keyboard; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++	virtual OSString *getTransport() APPLE_KEXT_OVERRIDE { return OSString::withCString("USB"); }
++};
++OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++
++class SweetHIDPointer : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDPointer);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void report(int dx, int dy, UInt32 buttons, int wheel, int hwheel);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Mouse; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
++	virtual OSString *getTransport() APPLE_KEXT_OVERRIDE { return OSString::withCString("USB"); }
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 8000; }
++private:
++	UInt32 fButtons;
++};
++OSDefineMetaClassAndStructors(SweetHIDPointer, IOHIDEventService);
++
++static SweetHIDKeyboard *gSweetKeyboard;
++static SweetHIDPointer *gSweetPointer;
++
++bool
++SweetHIDKeyboard::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	/* An external keyboard: iPadOS hides the on-screen keyboard for it. */
++	setProperty(kIOHIDBuiltInKey, kOSBooleanFalse);
++	gSweetKeyboard = this;
++	registerService();
++	IOLog("SWEET HID: keyboard registered\n");
++	return true;
++}
++
++void
++SweetHIDKeyboard::key(UInt32 page, UInt32 usage, bool down)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down);
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++bool
++SweetHIDPointer::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOHIDBuiltInKey, kOSBooleanFalse);
++	gSweetPointer = this;
++	registerService();
++	IOLog("SWEET HID: pointer registered\n");
++	return true;
++}
++
++void
++SweetHIDPointer::report(int dx, int dy, UInt32 buttons, int wheel, int hwheel)
++{
++	uint64_t now = mach_absolute_time();
++	if (dx || dy || buttons != fButtons) {
++		IOHIDEvent *event = IOHIDEvent::relativePointerEvent(now, dx, dy, 0, buttons, fButtons);
++		if (event) {
++			dispatchEvent(event);
++			event->release();
++		}
++		fButtons = buttons;
++	}
++	if (wheel || hwheel) {
++		IOHIDEvent *event = IOHIDEvent::scrollEvent(now, hwheel, wheel, 0);
++		if (event) {
++			dispatchEvent(event);
++			event->release();
++		}
++	}
++}
++
++/* page/usage as in the USB HID report (keyboard page 7, consumer page 12). */
++extern "C" void
++sweet_hid_kbd(unsigned page, unsigned usage, int down)
++{
++	if (gSweetKeyboard) {
++		gSweetKeyboard->key(page, usage, down != 0);
++	}
++}
++
++extern "C" void
++sweet_hid_pointer(int dx, int dy, unsigned buttons, int wheel, int hwheel)
++{
++	if (gSweetPointer) {
++		gSweetPointer->report(dx, dy, buttons, wheel, hwheel);
++	}
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..5f6a6f6 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,13 +38,13 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-    "     'IONameMatch'     = 'xiaomi,sweet';"
++    "     'IONameMatch'     = ('xiaomi,sweet', 'raspberrypi,5-model-b');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = ('qcom,kryo470', 'arm,cortex-a76');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+@@ -78,6 +78,16 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDKeyboard;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDKeyboard;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDPointer;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDPointer;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..af3ae5c 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,21 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++//
++//	SWEET (Pi 5): root on an MBR partition of the SD card (bsd/dev/sweet_sd.c)
++//
++	if (strcmp(rdBootVar, "sdroot0") == 0) {
++		extern int sweet_sd_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int sd_error = sweet_sd_rootdev(root);
++		if (sd_error) {
++			panic("IOFindBSDRoot: SWEET SD root %s unavailable: %d", rdBootVar, sd_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..895c357 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,12 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if SWEET_BOARD_PI5
++	/* Early framebuffer console on whatever the shim reported (start.s stage 0
++	 * used the same boot_args->Video values); none = console off (QEMU). */
++	sweet_early_set_fb(args->Video.v_baseAddr, args->Video.v_width, args->Video.v_height,
++	    args->Video.v_rowBytes, args->Video.v_depth);
++#endif
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..018eaab 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1837,18 +1837,68 @@ static void
+ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++#if SWEET_BOARD_PI5
++	/* Runtime framebuffer from boot_args (sweet_early_set_fb); 0 = console off. */
++	const uint64_t block_pa = sweet_early_fb_pa() & ~(uint64_t)ARM_TT_L2_OFFMASK;
++	if (sweet_early_fb_pa() == 0) {
++		return;
++	}
++#else
++	const uint64_t block_pa = SWEET_EARLY_FB_BLOCK_PA;
++#endif
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+-	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	const tt_entry_t want = block_pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++#if SWEET_BOARD_PI5
++	/* Called twice on Pi 5 (see sweet_early_map_retry): may already be ours. */
++	assert(*slot == ARM_TTE_EMPTY || *slot == want);
++#else
++	assert(*slot == ARM_TTE_EMPTY);
++#endif
++	*slot = want;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
++
++#if SWEET_BOARD_PI5
++/*
++ * Real Pi 5 (8ffdc02): after the TTBR1 switch, AT S1E1W on the framebuffer
++ * VA gave a level 2 translation fault although sweet_early_map_final wrote
++ * the block entry (QEMU translates). The early console paused at stage 8c.
++ * Now cpu_tte points at the final tables through the final physmap: write
++ * the entry again, make it visible to the table walker, flush the TLB and
++ * let the console re-check. Reports what the slot held before the rewrite.
++ */
++static void
++sweet_early_map_retry(void)
++{
++	if (!sweet_early_suspended()) {
++		return;
++	}
++	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	if ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
++		sweet_early_resume(l1, 0, 0);   /* AT will fault: console off */
++		return;
++	}
++	tt_entry_t *slot = &((tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK))[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++	tt_entry_t before = *slot;
++	if (before != ARM_TTE_EMPTY && (before & ARM_TTE_TYPE_MASK) != ARM_TTE_TYPE_BLOCK) {
++		sweet_early_resume(l1, before, before);  /* something else lives here: leave it */
++		return;
++	}
++	sweet_early_map_final();
++	__asm__ volatile("dsb ish" ::: "memory");
++	flush_mmu_tlb();
++	__builtin_arm_isb(ISB_SY);
++	sweet_early_resume(l1, before, *slot);
++}
++#endif
+ #endif
+ 
+ void
+@@ -2190,7 +2240,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if defined(SWEET)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++#if SWEET_BOARD_PI5
++	sweet_early_relocate(SWEET_EARLY_FB_VA + (sweet_early_fb_pa() & ARM_TT_L2_OFFMASK));
++#else
++	sweet_early_relocate(SWEET_EARLY_FB_VA + SWEET_EARLY_FB_BLOCK_OFF);
++#endif
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+@@ -2201,6 +2255,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
+ 	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
+ 	sweet_early_mark(11, "physmap table pointers rebound");
++#if SWEET_BOARD_PI5
++	sweet_early_map_retry();
++#endif
+ 
+ 	// From here on out, we're off the bootstrap translation tables.
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..85bb1fa 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1861,24 +1861,38 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++#if SWEET_GICV2
++	/* Pi 5 GIC-400: memory-mapped CPU interface (pe_fiq.c). */
++#define SWEET_GIC_EOI(v) sweet_gic_eoi((uint32_t)(v))
++	uint64_t iar = sweet_gic_ack();
++	uint32_t intid = (uint32_t)(iar & GICC_IAR_INTID_MASK);
++#else
++#define SWEET_GIC_EOI(v) __builtin_arm_wsr64("ICC_EOIR1_EL1", (v))
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++#endif
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
++#if SWEET_GICV2
++		sweet_gic_note_timer();   /* per-CPU count for the SweetCPU summary */
++#endif
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 		__builtin_arm_isb(ISB_SY);
++#if SWEET_GICV2
++		sweet_gic_note_sgi();   /* per-CPU count for the SweetCPU IPI test */
++#endif
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+@@ -1888,9 +1902,10 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
++#undef SWEET_GIC_EOI
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..54e5b63 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,13 @@ LEXT(sweet_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
++#if !SWEET_GICV2
+ 	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++#endif /* Pi 5 GIC-400 has no ICC_* sysregs: ICC_SRE_EL2 is UNDEFINED there */
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+@@ -515,10 +517,24 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++#if SWEET_BOARD_PI5
++	/*
++	 * Pi 5: the framebuffer the shim reports in boot_args->Video (base 40,
++	 * rowBytes 56, height 72); none (QEMU without one) = no early console.
++	 * The firmware places and sizes it per HDMI mode, so no constants.
++	 */
++	ldr		x0, [x20, #40]
++	cbz		x0, Lsweet_mark_done
++	ldr		x4, [x20, #56]
++	ldr		x2, [x20, #72]
++	sub		x2, x2, #32
++	madd	x0, x2, x4, x0
++#else
++	MOV64	x0, (SWEET_EARLY_FB_PA + (SWEET_EARLY_FB_H - 32) * SWEET_EARLY_FB_STRIDE)
++	mov		x4, #SWEET_EARLY_FB_STRIDE
++#endif
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -530,6 +546,7 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++Lsweet_mark_done:
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -686,13 +703,23 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++#if SWEET_BOARD_PI5
++	/* Block containing boot_args->Video.v_baseAddr; none = no mapping. */
++	ldr		x10, [x20, #40]
++	cbz		x10, Lsweet_fbmap_done
++	bic		x10, x10, #(ARM_TT_L2_OFFMASK)
++#else
++	MOV64	x10, SWEET_EARLY_FB_BLOCK_PA
++#endif
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#if SWEET_BOARD_PI5
++Lsweet_fbmap_done:
++#endif
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..343dcf3 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -10,12 +10,25 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <arm64/proc_reg.h>
++#include <pexpert/pexpert.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++#if SWEET_BOARD_PI5
++/* Pi 5: whatever framebuffer the shim reported (sweet_early_set_fb). */
++static volatile uint32_t *early_fb;
++static uint64_t early_fb_pa;
++static unsigned int early_w, early_h, early_stride_px;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH early_w
++#define EARLY_HEIGHT early_h
++#define EARLY_STRIDE early_stride_px
++#else
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PA;
++#define EARLY_FB early_fb
++#define EARLY_WIDTH ((unsigned int)SWEET_EARLY_FB_W)
++#define EARLY_HEIGHT ((unsigned int)SWEET_EARLY_FB_H)
++#define EARLY_STRIDE ((unsigned int)SWEET_EARLY_FB_STRIDE / 4)
++#endif
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -27,6 +40,8 @@ extern unsigned char iso_font[256 * 16];
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
++/* Pi 5: final framebuffer VA not translating yet (stage 8b); retried after stage 11. */
++static unsigned int early_suspended;
+ 
+ static void
+ sweet_early_clear_row(void)
+@@ -42,7 +57,7 @@ sweet_early_clear_row(void)
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled || early_suspended) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -89,7 +104,7 @@ sweet_early_string(const char *s)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if (early_disabled || early_suspended || stage > 20) {
+ 		return;
+ 	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+@@ -112,7 +127,7 @@ sweet_early_mark(unsigned int stage, const char *label)
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	if (early_disabled || early_suspended || early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
+@@ -125,10 +140,53 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++#if SWEET_BOARD_PI5
++static void
++sweet_early_hex(uint64_t v)
++{
++	sweet_early_string("0x");
++	for (int i = 60; i >= 0; i -= 4) {
++		unsigned int d = (unsigned int)(v >> i) & 0xf;
++		sweet_early_putc((char)(d < 10 ? '0' + d : 'a' + d - 10));
++	}
++}
++#endif
++
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
++#if SWEET_BOARD_PI5
++	/*
++	 * Real Pi 5 (kernel 23d34a5) stopped right here: stage 9 is the first
++	 * draw through this VA. Ask the MMU what the VA translates to and print
++	 * it through the still-working VA=PA alias first. PAR_EL1 bit 0 = fault
++	 * (FST in [6:1]); otherwise PA in [47:12], memory attributes in [63:56].
++	 */
++	uint64_t par;
++	__asm__ volatile ("at s1e1w, %1\n isb\n mrs %0, par_el1" : "=r"(par) : "r"(base) : "memory");
++	sweet_early_string("SWEET EARLY 8b: fb VA ");
++	sweet_early_hex(base);
++	sweet_early_string(" PAR ");
++	sweet_early_hex(par);
++	sweet_early_string(" want PA ");
++	sweet_early_hex(early_fb_pa);
++	sweet_early_putc('\n');
++	/* -sweet_fb_defer forces the deferred path, to test it in QEMU. */
++	if ((par & 1) || PE_parse_boot_argn("-sweet_fb_defer", NULL, 0)) {
++		/*
++		 * Real Pi 5 (8ffdc02): PAR 0xd = level 2 translation fault, while QEMU
++		 * translates. Do not draw through a missing mapping (that hung the
++		 * boot): pause, and let arm_vm_init rewrite the entry through the
++		 * final tables after stage 11 (sweet_early_resume).
++		 */
++		sweet_early_string("SWEET EARLY 8c: fault; console paused until stage 11\n");
++		early_fb = (volatile uint32_t *)(uintptr_t)base;
++		early_suspended = 1;
++		__asm__ volatile("dsb sy" ::: "memory");
++		return;
++	}
++#endif
+ 	early_fb = (volatile uint32_t *)(uintptr_t)base;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+@@ -140,4 +198,67 @@ sweet_early_disable(void)
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
++
++#if SWEET_BOARD_PI5
++/*
++ * arm_init, before the first mark: the framebuffer from boot_args->Video.
++ * start.s already drew stage 0 and mapped its 32MB block VA=PA from the
++ * same values. Anything unusable (QEMU: base 0) turns the console off.
++ */
++void
++sweet_early_set_fb(uint64_t base, uint64_t width, uint64_t height, uint64_t row_bytes, uint64_t depth)
++{
++	if (base == 0 || depth != 32 || width < 64 || height < 64 || row_bytes < width * 4 ||
++	    (base & ARM_TT_L2_OFFMASK) + row_bytes * height > ARM_TT_L2_SIZE) {
++		sweet_early_disable();
++		return;
++	}
++	early_fb_pa = base;
++	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_w = (unsigned int)width;
++	early_h = (unsigned int)height;
++	early_stride_px = (unsigned int)(row_bytes / 4);
++}
++
++uint64_t
++sweet_early_fb_pa(void)
++{
++	return early_disabled ? 0 : early_fb_pa;
++}
++
++int
++sweet_early_suspended(void)
++{
++	return !early_disabled && early_suspended;
++}
++
++/*
++ * arm_vm_init after stage 11, once arm_vm_init rewrote the framebuffer block
++ * entry through the final page tables and flushed the TLB: draw again if the
++ * MMU now translates the VA, else give up on the early console (the
++ * sweet-fbcon serial console takes over at serial_init).
++ */
++void
++sweet_early_resume(uint64_t l1, uint64_t slot_before, uint64_t slot_now)
++{
++	uint64_t par;
++	uint64_t va = (uint64_t)(uintptr_t)early_fb;
++	__asm__ volatile ("at s1e1w, %1\n isb\n mrs %0, par_el1" : "=r"(par) : "r"(va) : "memory");
++	if (par & 1) {
++		sweet_early_disable();
++		return;
++	}
++	early_suspended = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_string("SWEET EARLY 11b: fb VA live after retry, PAR ");
++	sweet_early_hex(par);
++	sweet_early_string("\n  L1 ");
++	sweet_early_hex(l1);
++	sweet_early_string(" slot before ");
++	sweet_early_hex(slot_before);
++	sweet_early_string(" now ");
++	sweet_early_hex(slot_now);
++	sweet_early_putc('\n');
++}
++#endif
+ #endif /* SWEET */
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..53e387a 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,6 +12,12 @@ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++#if SWEET_BOARD_PI5
++void sweet_early_set_fb(uint64_t base, uint64_t width, uint64_t height, uint64_t row_bytes, uint64_t depth);
++uint64_t sweet_early_fb_pa(void);       /* 0 = early console off */
++int sweet_early_suspended(void);
++void sweet_early_resume(uint64_t l1, uint64_t slot_before, uint64_t slot_now);
++#endif
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..4bd4b61 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,183 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#elif SWEET_GICV2
++/*
++ * Raspberry Pi 5 GIC-400 (GICv2). No ICC_* system registers: the CPU
++ * interface (GICC) is memory mapped. TF-A runs the GIC with security
++ * extensions, so from EL1 non-secure everything we can see is Group 1 and
++ * arrives as an IRQ (sleh_irq). Sequence verified on hardware by shim-pi5:
++ * GICD_CTLR bit 0, priority 0xA0, GICC_PMR 0xF0, GICC_CTLR bit 0.
++ *
++ * ADT /arm-io/gic "reg" = <GICD base, GICD size, GICC base, GICC size>,
++ * arm-io relative, same shape as the GICv3 node (GICR replaced by GICC).
++ */
++SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++
++static vm_offset_t gicd_base;
++static vm_offset_t gicc_base;
++/* GIC CPU-interface target mask of each logical CPU, for GICD_SGIR. */
++static uint8_t gic_cpu_mask[SWEET_SMP_MAX_CPUS];
++/* Banked GICD_IGROUPR0 as each CPU saw it in pe_init_fiq (bit set = Group 1). */
++static uint32_t gic_igroupr0[SWEET_SMP_MAX_CPUS];
++
++static inline uint32_t
++gic_read32(vm_offset_t addr)
++{
++	return *((volatile uint32_t *) addr);
++}
++
++static inline void
++gic_write32(vm_offset_t addr, uint32_t value)
++{
++	*((volatile uint32_t *) addr) = value;
++}
++
++void
++pe_init_fiq()
++{
++	int error;
++	DTEntry entry;
++
++	if (!gicd_base) {
++		error = SecureDTLookupEntry(NULL, "/arm-io/gic", &entry);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++		void const *prop;
++		unsigned int prop_size;
++		error = SecureDTGetProperty(entry, "reg", &prop, &prop_size);
++		if (error != kSuccess || prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: GIC reg must be <GICD size GICC size>, got %u bytes", __func__,
++			    error == kSuccess ? prop_size : 0);
++		}
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess &&
++		    timer_size == sizeof(uint32_t)) {
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			sweet_vtimer_intid = intid;
++		}
++
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++		uint64_t const *reg = (uint64_t const *)prop;
++		gicd_base = ml_io_map(soc_base_phys + reg[0], reg[1]);
++		gicc_base = ml_io_map(soc_base_phys + reg[2], reg[3]);
++		if (!gicd_base || !gicc_base) {
++			panic("%s: cannot map GICD/GICC", __func__);
++		}
++		kprintf("SWEET GIC: GICv2 GICD 0x%llx GICC 0x%llx, virtual timer INTID %u\n",
++		    (uint64_t)(soc_base_phys + reg[0]), (uint64_t)(soc_base_phys + reg[2]),
++		    sweet_vtimer_intid);
++
++		/* Distributor: non-secure view, bit 0 = EnableGrp1. */
++		gic_write32(gicd_base + GICD_CTLR_V2, gic_read32(gicd_base + GICD_CTLR_V2) | 1);
++	}
++
++	/*
++	 * Per CPU. GICD_ITARGETSR0-7 are banked: byte 0 reads back this CPU's
++	 * own interface mask, which GICD_SGIR needs to reach it.
++	 */
++	unsigned int cpu = ml_get_cpu_number_local();
++	uint8_t mask = (uint8_t)(gic_read32(gicd_base + GICD_ITARGETSR) & 0xff);
++	if (cpu < SWEET_SMP_MAX_CPUS) {
++		gic_cpu_mask[cpu] = mask;
++		gic_igroupr0[cpu] = gic_read32(gicd_base + GICD_IGROUPR);
++	}
++
++	/* SGIs and PPIs (banked): priority, then enable timer and IPI SGI. */
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gic_write32(gicd_base + GICD_IPRIORITYR + i, 0xA0A0A0A0);
++	}
++	gic_write32(gicd_base + GICD_ISENABLER, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	/* CPU interface: accept priority < 0xF0, no preemption grouping, EOImode 0. */
++	gic_write32(gicc_base + GICC_PMR, 0xF0);
++	gic_write32(gicc_base + GICC_BPR, 0);
++	gic_write32(gicc_base + GICC_CTLR, 1);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++	/* IGROUPR0 (banked): set bit = Group 1 = deliverable to us from the non-secure side. */
++	kprintf("SWEET GIC: cpu %u interface mask 0x%x IGROUPR0 0x%08x GICC_CTLR 0x%x GICD_CTLR 0x%x\n",
++	    cpu, mask, gic_read32(gicd_base + GICD_IGROUPR), gic_read32(gicc_base + GICC_CTLR),
++	    gic_read32(gicd_base + GICD_CTLR_V2));
++}
++
++/* SGIs taken per CPU (sleh_irq), for the cross-CPU IPI test in SweetCPU. */
++static uint32_t gic_sgi_rx[SWEET_SMP_MAX_CPUS];
++/* Virtual timer IRQs taken per CPU, and each CPU's banked IGROUPR0 at init. */
++static uint32_t gic_timer_rx[SWEET_SMP_MAX_CPUS];
++
++void
++sweet_gic_note_timer(void)
++{
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (cpu < SWEET_SMP_MAX_CPUS) {
++		os_atomic_inc(&gic_timer_rx[cpu], relaxed);
++	}
++}
++
++uint32_t
++sweet_gic_timer_rx(unsigned int cpu)
++{
++	return cpu < SWEET_SMP_MAX_CPUS ? os_atomic_load(&gic_timer_rx[cpu], relaxed) : 0;
++}
++
++uint32_t
++sweet_gic_igroupr0(unsigned int cpu)
++{
++	return cpu < SWEET_SMP_MAX_CPUS ? gic_igroupr0[cpu] : 0;
++}
++
++void
++sweet_gic_note_sgi(void)
++{
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (cpu < SWEET_SMP_MAX_CPUS) {
++		os_atomic_inc(&gic_sgi_rx[cpu], relaxed);
++	}
++}
++
++uint32_t
++sweet_gic_sgi_rx(unsigned int cpu)
++{
++	return cpu < SWEET_SMP_MAX_CPUS ? os_atomic_load(&gic_sgi_rx[cpu], relaxed) : 0;
++}
++
++uint32_t
++sweet_gic_cpu_mask(unsigned int cpu)
++{
++	return cpu < SWEET_SMP_MAX_CPUS ? gic_cpu_mask[cpu] : 0;
++}
++
++uint32_t
++sweet_gic_ack(void)
++{
++	return gic_read32(gicc_base + GICC_IAR);
++}
++
++void
++sweet_gic_eoi(uint32_t iar)
++{
++	gic_write32(gicc_base + GICC_EOIR, iar);
++}
++
++void
++sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi)
++{
++	uint8_t mask = cpu < SWEET_SMP_MAX_CPUS ? gic_cpu_mask[cpu] : 0;
++	if (mask == 0) {
++		/* Target has not run pe_init_fiq yet: GIC-400 interface n = core n on BCM2712. */
++		mask = (uint8_t)(1U << cpu);
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	/* TargetListFilter 0 (use the list), CPUTargetList [23:16], SGIINTID [3:0]. */
++	gic_write32(gicd_base + GICD_SGIR, ((uint32_t)mask << 16) | (sgi & 0xF));
++	__builtin_arm_isb(ISB_SY);
++}
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..a63c47a 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -657,8 +657,11 @@ vmapple_uart_init(void)
+ 		PL011_LCR_PARITY_DISABLE |
+ 		PL011_LCR_BREAK_DISABLE
+ 		);
++#if !SWEET_BOARD_PI5
++	/* Pi 5: keep the firmware's 115200 divisor (enable_uart=1, 44.2368 MHz clock). */
+ 	VMAPPLE_UART0_IBRD = PL011_IBRD_DIV_38400;
+ 	VMAPPLE_UART0_FBRD = PL011_FBRD_DIV_38400;
++#endif
+ 	VMAPPLE_UART0_TIMSC = 0x0;
+ 	VMAPPLE_UART0_ICR = PL011_ICR_CLR_ALL_IRQS;
+ 	VMAPPLE_UART0_CR = (
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..c5341e9 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,18 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++#if SWEET_BOARD_PI5
++/* GICv2 (pe_fiq.c): memory-mapped CPU interface instead of ICC_* sysregs. */
++uint32_t sweet_gic_ack(void);
++void sweet_gic_eoi(uint32_t iar);
++void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++void sweet_gic_note_sgi(void);
++uint32_t sweet_gic_sgi_rx(unsigned int cpu);
++uint32_t sweet_gic_cpu_mask(unsigned int cpu);
++void sweet_gic_note_timer(void);
++uint32_t sweet_gic_timer_rx(unsigned int cpu);
++uint32_t sweet_gic_igroupr0(unsigned int cpu);
++#endif
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..38d6c91 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -17,6 +17,23 @@
+ 
+ #define SWEET                     1
+ 
++/* Board variant: -DSWEET_BOARD_PI5=1 from MACHINE_FLAGS_ARM64_SWEET (CI input board=pi5). */
++#ifndef SWEET_BOARD_PI5
++#define SWEET_BOARD_PI5           0
++#endif
++
++#if SWEET_BOARD_PI5
++/*
++ * Raspberry Pi 5 (BCM2712), built from the same SWEET config with
++ * -DSWEET_BOARD_PI5=1: 4x Cortex-A76 r4p1 (MPIDR 0x81000n00: MT=1, core in
++ * Aff1), GIC-400 = GICv2 with a memory-mapped CPU interface and no ICC_*
++ * system registers, PL011 debug UART, PSCI 1.1 over smc. Values measured
++ * by shim-pi5 stage 1 on real hardware (PI5-PORT.md).
++ */
++#define SWEET_SMP_MAX_CPUS         4
++#define SWEET_GICV2                1
++#define VMAPPLE_UART                      /* XNU's PL011 driver */
++#else
+ /*
+  * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+  * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+@@ -24,6 +41,28 @@
+  * clusters yet).
+  */
+ #define SWEET_SMP_MAX_CPUS         8
++#define SWEET_GICV2                0
++#endif
++
++/*
++ * Boot splash framebuffer for the early console (start.s, arm_vm_init.c,
++ * sweet_early.c). It is mapped as one 32MB L2 block (16K pages), so the
++ * block base and the framebuffer's offset inside it are given separately.
++ */
++#if SWEET_BOARD_PI5
++#define SWEET_EARLY_FB_BLOCK_PA   0x3e000000      /* fb 0x3f400000, 1920x1080 */
++#define SWEET_EARLY_FB_BLOCK_OFF  0x01400000
++#define SWEET_EARLY_FB_W          1920
++#define SWEET_EARLY_FB_H          1080
++#define SWEET_EARLY_FB_STRIDE     7680
++#else
++#define SWEET_EARLY_FB_BLOCK_PA   0x9c000000      /* ABL cont_splash_region */
++#define SWEET_EARLY_FB_BLOCK_OFF  0x0
++#define SWEET_EARLY_FB_W          1080
++#define SWEET_EARLY_FB_H          2400
++#define SWEET_EARLY_FB_STRIDE     4320
++#endif
++#define SWEET_EARLY_FB_PA         (SWEET_EARLY_FB_BLOCK_PA + SWEET_EARLY_FB_BLOCK_OFF)
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+@@ -36,7 +75,9 @@
+ #define __ARM_PAN_AVAILABLE__     1
+ #define __ARM_16K_PG__            1
+ 
++#if !SWEET_GICV2
+ #define HAS_GIC_V3                1
++#endif
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+@@ -47,9 +88,29 @@
+  * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
++#if SWEET_BOARD_PI5
++#define SWEET_VTIMER_INTID        27      // standard PPI 11; the ADT can override
++#else
+ #define SWEET_VTIMER_INTID        19
++#endif
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
++#if SWEET_GICV2
++/* GICv2 / GIC-400 (Arm IHI 0048B), non-secure view: everything is Group 1. */
++#define GICD_CTLR_V2              0x000
++#define GICD_IGROUPR              0x080
++#define GICD_ISENABLER            0x100
++#define GICD_IPRIORITYR           0x400
++#define GICD_ITARGETSR            0x800
++#define GICD_SGIR                 0xF00
++#define GICC_CTLR                 0x00
++#define GICC_PMR                  0x04
++#define GICC_BPR                  0x08
++#define GICC_IAR                  0x0C
++#define GICC_EOIR                 0x10
++#define GICC_IAR_INTID_MASK       0x3FF
++#endif
++
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+ 
+ #define GICR_PE_SIZE              0x20000 // Size of each redistributor region
