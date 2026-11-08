@@ -93,9 +93,154 @@ int loader_find(uintptr_t fdt, uint64_t *start, uint64_t *end)
 	return (*start & 7) == 0 && *end > *start + 0x2a8 && magic_ok((const volatile char *)*start);
 }
 
+/*
+ * Apple device tree editing, in place (same-size values only). Layout
+ * (tools/adt.py): node = u32 nprops, u32 nchildren, props, children;
+ * prop = char name[32], u32 len (bit 31 a flag), value padded to 4 bytes.
+ * The MMU is off (all memory is Device): only aligned 32-bit and byte accesses.
+ */
+static uint32_t adt_rd(uintptr_t a) { return *(volatile uint32_t *)a; }
+static void adt_wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+
+static int adt_streq(uintptr_t a, const char *s, int max)
+{
+	int i;
+	for (i = 0; i < max && s[i]; i++)
+		if (*(volatile const char *)(a + i) != s[i])
+			return 0;
+	return i == max || *(volatile const char *)(a + i) == 0;
+}
+
+static uintptr_t adt_skip(uintptr_t n)
+{
+	uint32_t np = adt_rd(n), nc = adt_rd(n + 4);
+	uintptr_t p = n + 8;
+	for (uint32_t i = 0; i < np; i++)
+		p += 36 + (((adt_rd(p + 32) & 0x7fffffff) + 3) & ~3u);
+	for (uint32_t i = 0; i < nc; i++)
+		p = adt_skip(p);
+	return p;
+}
+
+static int adt_prop(uintptr_t n, const char *name, uintptr_t *val, uint32_t *len)
+{
+	uint32_t np = adt_rd(n);
+	uintptr_t p = n + 8;
+	for (uint32_t i = 0; i < np; i++) {
+		uint32_t l = adt_rd(p + 32) & 0x7fffffff;
+		if (adt_streq(p, name, 32)) {
+			*val = p + 36;
+			*len = l;
+			return 1;
+		}
+		p += 36 + ((l + 3) & ~3u);
+	}
+	return 0;
+}
+
+/* Child of n whose "name" property is the first namelen chars of name. */
+static uintptr_t adt_child(uintptr_t n, const char *name, int namelen)
+{
+	uint32_t np = adt_rd(n), nc = adt_rd(n + 4);
+	uintptr_t p = n + 8;
+	for (uint32_t i = 0; i < np; i++)
+		p += 36 + (((adt_rd(p + 32) & 0x7fffffff) + 3) & ~3u);
+	for (uint32_t i = 0; i < nc; i++) {
+		uintptr_t v;
+		uint32_t l;
+		if (adt_prop(p, "name", &v, &l) && (int)l >= namelen) {
+			int ok = 1;
+			for (int k = 0; k < namelen && ok; k++)
+				ok = *(volatile const char *)(v + k) == name[k];
+			if (ok && ((int)l == namelen || *(volatile const char *)(v + namelen) == 0))
+				return p;
+		}
+		p = adt_skip(p);
+	}
+	return 0;
+}
+
+/* "/a/b" -> node, or 0. */
+static uintptr_t adt_path(uintptr_t root, const char *path)
+{
+	uintptr_t n = root;
+	while (n && *path == '/') {
+		path++;
+		int l = 0;
+		while (path[l] && path[l] != '/')
+			l++;
+		if (l)
+			n = adt_child(n, path, l);
+		path += l;
+	}
+	return n;
+}
+
+/* Overwrite a u32 or u64 property (value 4-byte aligned). */
+static int adt_set(uintptr_t root, const char *path, const char *name, int idx, uint64_t v, int size)
+{
+	uintptr_t n = adt_path(root, path), val;
+	uint32_t len;
+	if (!n || !adt_prop(n, name, &val, &len) || (uint32_t)(idx + 1) * size > len)
+		return 0;
+	val += (uintptr_t)idx * size;
+	adt_wr(val, (uint32_t)v);
+	if (size == 8)
+		adt_wr(val + 4, (uint32_t)(v >> 32));
+	return 1;
+}
+
+/*
+ * Per-board values (see tools/mkadt_pi5.py): serial number, RAM size for
+ * boards with less RAM than the ADT assumes, the firmware framebuffer.
+ * Returns the kernel-managed RAM size to put in boot_args.
+ */
+static uint64_t adt_patch(uintptr_t adt, uint64_t phys_base, uint64_t mem_size,
+			  const struct loader_video *video, const struct loader_board *board)
+{
+	uintptr_t n, val;
+	uint32_t len;
+
+	if (board && board->serial && (n = adt_path(adt, "/")) && adt_prop(n, "serial-number", &val, &len) && len) {
+		uint32_t i;
+		for (i = 0; i + 1 < len && board->serial[i]; i++)
+			*(volatile char *)(val + i) = board->serial[i];
+		for (; i < len; i++)
+			*(volatile char *)(val + i) = 0;
+		pr("ADT serial-number %s\n", board->serial);
+	}
+
+	/* dram-size = mem_size; the panic log (/pram) sits right above it. */
+	uintptr_t pram = adt_path(adt, "/pram");
+	uint64_t panic_size = 0;
+	if (pram && adt_prop(pram, "reg", &val, &len) && len >= 16)
+		panic_size = adt_rd(val + 8) | (uint64_t)adt_rd(val + 12) << 32;
+	if (board && board->ram_top && panic_size && phys_base + mem_size + panic_size > board->ram_top) {
+		uint64_t total = (board->ram_top - phys_base) & ~((16UL << 20) - 1);
+		mem_size = total - panic_size;
+		adt_set(adt, "/chosen", "dram-size", 0, mem_size, 8);
+		adt_set(adt, "/pram", "reg", 0, phys_base + mem_size, 8);
+		pr("ADT RAM lowered to %lu MiB (board RAM ends at %lx)\n", mem_size >> 20, board->ram_top);
+	}
+
+	if (video && video->base) {
+		uint64_t fbsize = (video->stride * video->height + 0x3fff) & ~0x3fffUL;
+		adt_set(adt, "/sweet-fbcon", "reg", 0, video->base, 8);
+		adt_set(adt, "/sweet-fbcon", "reg", 1, fbsize, 8);
+		adt_set(adt, "/sweet-fbcon", "width", 0, video->width, 4);
+		adt_set(adt, "/sweet-fbcon", "height", 0, video->height, 4);
+		adt_set(adt, "/sweet-fbcon", "stride", 0, video->stride, 4);
+		adt_set(adt, "/arm-io/disp0", "canvas-width", 0, video->width, 4);
+		adt_set(adt, "/arm-io/disp0", "canvas-height", 0, video->height, 4);
+		pr("ADT display %lux%lu at %lx\n", video->width, video->height, video->base);
+	}
+	return mem_size;
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
-const char *loader_boot(uint64_t rd_start, uint64_t rd_end, const struct loader_video *video)
+const char *loader_boot(uint64_t rd_start, uint64_t rd_end, const struct loader_video *video,
+			const struct loader_board *board)
 {
 	const volatile struct payload *p = (const volatile struct payload *)rd_start;
 	if (p->version != 1 || (p->adt_off & 7))
@@ -126,6 +271,7 @@ const char *loader_boot(uint64_t rd_start, uint64_t rd_end, const struct loader_
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	uint64_t mem_size = adt_patch(adt_pa, p->phys_base, p->mem_size, video, board);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
@@ -135,7 +281,7 @@ const char *loader_boot(uint64_t rd_start, uint64_t rd_end, const struct loader_
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
 	ba->physBase = p->phys_base;
-	ba->memSize = p->mem_size;
+	ba->memSize = mem_size;
 	ba->topOfKernelData = top;
 	if (video && video->base) {
 		ba->Video.v_baseAddr = video->base;
@@ -149,7 +295,7 @@ const char *loader_boot(uint64_t rd_start, uint64_t rd_end, const struct loader_
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
+	ba->memSizeActual = mem_size;
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	pr("ADT %lx (%lu bytes), boot_args %lx, top %lx\n", (uint64_t)adt_pa, p->adt_size,

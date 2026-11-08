@@ -234,6 +234,24 @@ static void setup_fb(uintptr_t fdt)
 	pr("framebuffer %lx %ux%u stride %u %s\n", addr, w, h, stride, fmt ? fmt : "?");
 }
 
+/* Serial and RAM layout for loader_boot's ADT patching (any Pi 5 model). */
+static void board_info(uintptr_t fdt, struct loader_board *b)
+{
+	struct fdt_node n;
+	b->serial = 0;
+	b->ram_top = 0;
+	if (fdt_find_path(fdt, "/", &n))
+		b->serial = dt_string(fdt, &n, "serial-number");
+	/* The RAM region holding the kernel (it loads at 0x40000000). */
+	for (int i = 0; fdt_find_name(fdt, "memory", 1, i, &n); i++) {
+		uint64_t a, s;
+		for (int r = 0; fdt_reg(fdt, &n, r, &a, &s); r++)
+			if (a <= 0x40000000UL && a + s > 0x40000000UL && a + s > b->ram_top)
+				b->ram_top = a + s;
+	}
+	pr("board: serial %s, RAM above 0x40000000 ends at %lx\n", b->serial ? b->serial : "?", b->ram_top);
+}
+
 static void report_memory(uintptr_t fdt)
 {
 	struct fdt_node n;
@@ -391,7 +409,9 @@ void shim_main(uintptr_t fdt, uint64_t entry_el)
 		con_color(C_YELLOW);
 		pr("\nSWEETXNU payload found: booting xnu\n");
 		con_color(C_WHITE);
-		const char *err = loader_boot(rd_start, rd_end, &video);
+		struct loader_board board;
+		board_info(fdt, &board);
+		const char *err = loader_boot(rd_start, rd_end, &video, &board);
 		con_color(C_RED);
 		pr("BOOT FAILED: %s\n", err);
 		con_color(C_WHITE);

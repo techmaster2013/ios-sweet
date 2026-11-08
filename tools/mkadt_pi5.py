@@ -46,6 +46,16 @@ QEMU = dict(
 )
 
 PI5_ECID = 0x5049350000000001     # 'PI5' + 1, synthetic
+# Root serial-number: 32 bytes the shim fills with the board's serial
+# (firmware DT /serial-number) at boot.
+SERIAL_PLACEHOLDER = b'UNKNOWN'.ljust(32, b'\0')
+
+# Board-independence: everything below is the Pi 5 layout common to the
+# 2/4/8/16 GB models. What differs per board is patched into this ADT by the
+# shim at boot (shim-pi5/loader.c adt_patch): the serial, RAM size (dram-size
+# and /pram are lowered when the board has less RAM above PHYS_BASE than
+# MEM_SIZE, i.e. 2 GB models) and the firmware framebuffer (/sweet-fbcon,
+# /arm-io/disp0 canvas) for whatever HDMI mode the firmware picked.
 BOOT_MANIFEST_HASH = hashlib.sha384(b'pi5 boot manifest').digest()
 
 
@@ -184,6 +194,12 @@ def build(qemu=False, seed=None):
         ('home-button-type', u32(0)),
     ])
     pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
+    # Settings > General > About: Model Name is /product product-name.
+    product = node('product', [
+        ph(),
+        ('product-name', cstr('Raspberry Pi 5')),
+        ('product-description', cstr('Raspberry Pi 5')),
+    ])
 
     # Provisional iPad (6th generation, Wi-Fi) identity for the iPadOS 16
     # userland (stage 4 adds the real /product node from its IPSW).
@@ -196,9 +212,14 @@ def build(qemu=False, seed=None):
         ('target-type', cstr('J71b')),
         ('target-sub-type', cstr('J71bAP')),
         ('manufacturer', cstr('Apple Inc.')),
+        # About: Model Number and Serial Number. The shim overwrites this
+        # placeholder with the board's serial from the firmware DT
+        # (/serial-number); it stays the placeholder in QEMU.
+        ('model-number', cstr('RPI5')),
+        ('serial-number', SERIAL_PLACEHOLDER),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, buttons, pram] + extra)
+    ], [chosen, defaults, cpus, arm_io, buttons, pram, product] + extra)
 
 
 if __name__ == '__main__':
