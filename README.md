@@ -142,6 +142,18 @@ python3 tools/sweet-log.py log-area.bin boot.txt
 | `xhciscroll=N` | Scale (negative: invert) the mouse wheel |
 | `sweethidtest=N` | Press Home every N seconds (input-free testing) |
 
+## Apps
+
+Our own apps live in [apps](apps). They are SwiftUI projects built with [xtool](https://github.com/xtool-org/xtool) (no Mac needed), target iPadOS/iOS 16+, and run on a real iPhone/iPad as well as on the Pi. For the Pi image they are signed ad hoc with [tools/adhoc_sign.py](tools/adhoc_sign.py) and installed as built-in apps in `/Applications`.
+
+| App | What it does |
+| --- | --- |
+| [PiInfo](apps/PiInfo) | System information: device and board, iPadOS version and build, kernel version, CPU cores, memory, storage, screen, uptime, time zone. On the Pi port it recognizes our kernel and shows **Raspberry Pi 5**; on Apple hardware it shows the iPhone/iPad. |
+| [PiStrap](apps/PiStrap) | The jailbreak installer, in the style of Dopamine: one **Jailbreak** button plus options for Sileo, Zebra, TrollStore Lite, ElleKit and Cydia (Cydia uses the classic rootful layout, the rest rootless `/var/jb`). **Preview:** the steps (Procursus bootstrap, apt sources, package managers, `uicache`) are shown but not run yet; they need network and the bootstrap packages. |
+| [uicache reload](apps/UICacheReload) | Registers apps with iPadOS's app database (LaunchServices), like the jailbreak `uicache` tool, so apps copied into `/Applications` or `/var/jb/Applications` appear on the home screen. Opening it re-registers every non-Apple app and lists the results; a launchd job also runs it once at boot (`--boot`). No icon. |
+
+Build one with `xtool dev build -c release` in its folder (`xtool dev` installs it on a connected iPhone).
+
 ## Repository layout
 
 | Path | Contents |
