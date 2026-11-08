@@ -328,6 +328,30 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   strategy with partition bounds checks, devfs nodes, root via rd=), with
   SDHCI PIO transfers first (DMA later).
 
+### First userland boot on the Pi (2026-11-07, evening)
+
+- Kernel 44026ab (CI 42421982536) + ADT with /sweet-sd. Read-only boot
+  (`rd=sdroot0` only): `mount(7) failed` / `cannot mount root, errno = 19`
+  (journaled HFS+ needing journal init cannot mount read-only).
+- Payload `out-pi5/payload-sdrw.bin` (on the card as payload.bin), cmdline
+  `debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress -v rd=sdroot0 sdrw=1
+  rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1
+  wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1`: **root mounts,
+  launchd runs, daemons start**; an Apple logo + moving progress bar is drawn
+  by userland on HDMI (squashed ~2.4x vertically: portrait-panel
+  assumption). Seen: `exec xpcproxy` / `exec bluetoothd` repeating (no BT
+  hardware), fairplayd repeating, aggregated.
+- The image on the card was plain mkiosroot.sh output, WITHOUT
+  tools/sweet-root-tweaks.py: the progress bar is DataMigration (runs ~1 h
+  on every boot without com.apple.migration LastSystemVersion), Setup is not
+  skipped, CommCenter not removed, _PanicOnCrash still set (7 jobs).
+- `ipados-16.6.1-20G81-root-v2.img` (WSL ~/pi5-build) = image + tweaks with
+  SWEET_BUILD=20G81 SWEET_VERSION=16.6.1, SHA256 eadf91ed...872f, fsck OK.
+  Data ark skipped (no mobileactivationd container before first boot);
+  activation comes from the /chosen security-status properties anyway.
+  Not yet on the card (needs the elevated sd-write-root.ps1 again).
+- Display TODO (stage 4): landscape 1920x1080 panel, display-scale 1.
+
 ### SD root driver (bsd/dev/sweet_sd.c, 2026-11-07)
 
 - ADT `/sweet-sd`, reg = <0x107cfff000 0x260 0x107cfff400 0x200> (Pi only).
