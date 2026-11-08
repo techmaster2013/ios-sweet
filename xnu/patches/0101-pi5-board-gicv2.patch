@@ -849,10 +849,10 @@ index 0000000..2e545f3
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
 new file mode 100644
-index 0000000..2313bea
+index 0000000..e0d02c4
 --- /dev/null
 +++ b/bsd/dev/sweet_xhci.c
-@@ -0,0 +1,1251 @@
+@@ -0,0 +1,1426 @@
 +/*
 + * SWEET (Raspberry Pi 5) USB keyboard and mouse.
 + *
@@ -984,6 +984,8 @@ index 0000000..2313bea
 +#define DV_INT(i)       (0x1c00 + (i) * 0x200)
 +#define DV_BUF          0x2000          /* control transfer data, 1 KiB */
 +#define DV_REP(i)       (0x2400 + (i) * 0x40)
++#define DV_RXB          0x2800          /* iPhone USB Ethernet receive buffer, 2 KiB */
++#define ETH_RXB         0x800
 +#define D_SP            (D_DEV(MAX_DEV))        /* scratchpad pages */
 +
 +struct ring {
@@ -1030,6 +1032,17 @@ index 0000000..2313bea
 +	uint64_t base_dma;
 +	struct ring ep0;
 +	struct hid_if hid[MAX_HID];
++	/* iPhone USB tethering (Apple USB Ethernet, Linux "ipheth"): step 1, probe + receive. */
++	struct {
++		bool on;
++		uint8_t iface, alt, in_dci, out_dci;
++		uint16_t in_mps, out_mps;
++		struct ring in, out;
++		uint8_t *rx;
++		uint64_t rx_dma;
++		uint32_t frames;
++		uint8_t mac[6];
++	} eth;
 +};
 +
 +struct hc {
@@ -1147,6 +1160,7 @@ index 0000000..2313bea
 +}
 +
 +static void hid_report(struct hc *h, struct dev *d, struct hid_if *hi, uint32_t len);
++static void eth_rx(struct hc *h, struct dev *d, uint32_t len);
 +
 +/*
 + * Minimal HID report descriptor parser: finds the input fields of a mouse
@@ -1294,6 +1308,16 @@ index 0000000..2313bea
 +				h->xfer_slot = slot;
 +				h->xfer_rem = e->status & 0xffffff;
 +				h->xfer_done = true;
++			} else if (d && d->eth.on && epid == d->eth.in_dci) {
++				uint32_t len = ETH_RXB - MIN(e->status & 0xffffff, ETH_RXB);
++				if (cc == CC_SUCCESS || cc == CC_SHORT) {
++					eth_rx(h, d, len);
++				} else if (xdebug) {
++					printf("SWEET USB: hc%d slot %u eth rx completion %u\n", h->idx, slot, cc);
++				}
++				ring_put(h, &d->eth.in, (uint32_t)d->eth.rx_dma, (uint32_t)(d->eth.rx_dma >> 32),
++				    ETH_RXB, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
++				doorbell(h, d->slot, d->eth.in_dci);
 +			} else if (d) {
 +				for (int i = 0; i < MAX_HID; i++) {
 +					struct hid_if *hi = &d->hid[i];
@@ -1447,6 +1471,152 @@ index 0000000..2313bea
 +	return MAX(n, 3u);
 +}
 +
++/*
++ * iPhone USB tethering, step 1: find the configuration with the Apple USB
++ * Ethernet interface (class 0xff, subclass 0xfd, protocol 1; the alternate
++ * setting with a bulk IN and a bulk OUT endpoint), select it, read the
++ * phone's MAC and carrier (vendor requests 0x00 and 0x45, as Linux ipheth)
++ * and keep a bulk IN transfer queued, logging what arrives. Data only flows
++ * once the phone trusts this host (pairing: next step) with Personal Hotspot
++ * on.
++ */
++static void
++iphone_setup(struct hc *h, struct dev *d, uint8_t ncfg)
++{
++	uint8_t *buf = d->base + DV_BUF, *in = d->base + DV_IN;
++	uint8_t cfgval = 0, iface = 0, alt = 0, ep_in = 0, ep_out = 0;
++	uint16_t mps_in = 0, mps_out = 0;
++	uint32_t got;
++
++	for (uint8_t c = 0; c < ncfg && !cfgval; c++) {
++		got = 0;
++		if (control(h, d, 0x80, 6, (uint16_t)(0x0200 | c), 0, 9, &got)) {
++			continue;
++		}
++		uint16_t total = (uint16_t)MIN((uint32_t)(buf[2] | buf[3] << 8), 1024u);
++		uint8_t val = buf[5];
++		if (control(h, d, 0x80, 6, (uint16_t)(0x0200 | c), 0, total, &got)) {
++			continue;
++		}
++		bool cur = false;
++		uint8_t ci = 0, ca = 0, ei = 0, eo = 0;
++		uint16_t mi = 0, mo = 0;
++		for (uint32_t off = 0; off + 2 <= total && buf[off] >= 2; off += buf[off]) {
++			const uint8_t *x = &buf[off];
++			if (x[1] == 4 && x[0] >= 9) {
++				if (xdebug) {
++					printf("SWEET USB: iPhone config %u interface %u alt %u class %02x/%02x/%02x, %u endpoints\n",
++					    val, x[2], x[3], x[5], x[6], x[7], x[4]);
++				}
++				cur = x[5] == 0xff && x[6] == 0xfd && x[7] == 1;
++				ci = x[2];
++				ca = x[3];
++				ei = eo = 0;
++			} else if (x[1] == 5 && x[0] >= 7 && cur && (x[3] & 3) == 2) {   /* bulk */
++				uint16_t mps = (uint16_t)(x[4] | (x[5] & 7) << 8);
++				if (x[2] & 0x80) {
++					ei = x[2] & 0xf;
++					mi = mps;
++				} else {
++					eo = x[2] & 0xf;
++					mo = mps;
++				}
++				if (ei && eo) {
++					cfgval = val;
++					iface = ci;
++					alt = ca;
++					ep_in = ei;
++					ep_out = eo;
++					mps_in = mi;
++					mps_out = mo;
++					break;
++				}
++			}
++		}
++	}
++	if (!cfgval) {
++		printf("SWEET USB: hc%d port %u: Apple device without USB Ethernet in %u configurations\n",
++		    h->idx, d->port, ncfg);
++		return;
++	}
++	if (control(h, d, 0x00, 9, cfgval, 0, 0, NULL) ||                    /* SET_CONFIGURATION */
++	    control(h, d, 0x01, 11, alt, iface, 0, NULL)) {                  /* SET_INTERFACE */
++		printf("SWEET USB: iPhone: selecting configuration %u / interface %u alt %u failed\n",
++		    cfgval, iface, alt);
++		return;
++	}
++
++	d->eth.iface = iface;
++	d->eth.alt = alt;
++	d->eth.in_dci = (uint8_t)(2 * ep_in + 1);
++	d->eth.out_dci = (uint8_t)(2 * ep_out);
++	d->eth.in_mps = mps_in;
++	d->eth.out_mps = mps_out;
++	d->eth.rx = d->base + DV_RXB;
++	d->eth.rx_dma = d->base_dma + DV_RXB;
++	ring_init(h, &d->eth.in, d->base + DV_INT(0), INT_TRBS);
++	ring_init(h, &d->eth.out, d->base + DV_INT(1), INT_TRBS);
++
++	/* Configure Endpoint: bulk IN (type 6) and bulk OUT (type 2). */
++	ctx(h, in, 0)[0] = 0;
++	ctx(h, in, 0)[1] = 1u | 1u << d->eth.in_dci | 1u << d->eth.out_dci;
++	uint32_t *sc = ctx(h, in, 1);
++	sc[0] = (sc[0] & ~(0x1fu << 27)) | ((uint32_t)MAX(d->eth.in_dci, d->eth.out_dci) << 27);
++	struct {
++		uint8_t dci, type;
++		uint16_t mps;
++		struct ring *r;
++	} eps[2] = {
++		{ d->eth.in_dci, 6, mps_in, &d->eth.in },
++		{ d->eth.out_dci, 2, mps_out, &d->eth.out },
++	};
++	for (int i = 0; i < 2; i++) {
++		uint32_t *ec = ctx(h, in, 1 + eps[i].dci);
++		bzero(ec, h->ctxsz);
++		ec[1] = (3u << 1) | ((uint32_t)eps[i].type << 3) | ((uint32_t)eps[i].mps << 16);
++		ec[2] = (uint32_t)eps[i].r->dma | 1;
++		ec[3] = (uint32_t)(eps[i].r->dma >> 32);
++		ec[4] = 1024;
++	}
++	uint64_t in_dma = d->base_dma + DV_IN;
++	if (command(h, (uint32_t)in_dma, (uint32_t)(in_dma >> 32), TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)d->slot << 24, NULL)) {
++		return;
++	}
++
++	got = 0;
++	if (control(h, d, 0xc1, 0x00, 0, iface, 6, &got) == 0) {             /* GET_MACADDR */
++		memcpy(d->eth.mac, buf, 6);
++	}
++	int carrier = -1;
++	if (control(h, d, 0xc1, 0x45, 0, iface, 1, &got) == 0) {              /* CARRIER_CHECK */
++		carrier = buf[0];
++	}
++	d->eth.on = true;
++	ring_put(h, &d->eth.in, (uint32_t)d->eth.rx_dma, (uint32_t)(d->eth.rx_dma >> 32), ETH_RXB,
++	    TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
++	doorbell(h, d->slot, d->eth.in_dci);
++	printf("SWEET USB: iPhone USB Ethernet: config %u interface %u alt %u, bulk in %u (%u) out %u (%u), "
++	    "MAC %02x:%02x:%02x:%02x:%02x:%02x, carrier 0x%x (%s)\n",
++	    cfgval, iface, alt, ep_in, mps_in, ep_out, mps_out,
++	    d->eth.mac[0], d->eth.mac[1], d->eth.mac[2], d->eth.mac[3], d->eth.mac[4], d->eth.mac[5],
++	    carrier, carrier == 4 ? "on: tethering active" : "off: needs Trust + Personal Hotspot");
++}
++
++/* Received frame: 2 bytes of padding, then the Ethernet frame. Logged for now. */
++static void
++eth_rx(struct hc *h, struct dev *d, uint32_t len)
++{
++	uint8_t *f = d->eth.rx;
++	dsync(h, f, ETH_RXB);
++	d->eth.frames++;
++	if (len >= 2 + 14 && (d->eth.frames <= 20 || xdebug > 1)) {
++		const uint8_t *e = f + 2;
++		printf("SWEET USB: iPhone frame %u: %u bytes, %02x:%02x:%02x:%02x:%02x:%02x <- "
++		    "%02x:%02x:%02x:%02x:%02x:%02x type 0x%02x%02x\n", d->eth.frames, len - 2,
++		    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[10], e[11], e[12], e[13]);
++	}
++}
++
 +static void
 +enumerate(struct hc *h, uint32_t port)
 +{
@@ -1547,6 +1717,11 @@ index 0000000..2313bea
 +		printf("SWEET USB: hubs are not supported yet: plug the keyboard/mouse in directly\n");
 +		dev_free(h, d);
 +		return;
++	}
++	if (vid == 0x05ac) {
++		/* Apple: an iPhone/iPad offers USB tethering in one of its configurations. */
++		iphone_setup(h, d, buf[17]);
++		return;         /* keep the slot either way (no re-enumeration loop) */
 +	}
 +	got = 0;
 +	if (control(h, d, 0x80, 6, 0x0200, 0, 9, &got)) {
