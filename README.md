@@ -23,6 +23,7 @@ As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on
 | GUI | backboardd, SpringBoard, lock screen, home screen, dock, App Library, Settings, Messages, Safari |
 | Keyboard | USB keyboards (boot protocol) through our own xHCI driver for RP1's USB controllers. **Esc** or **F1** = Home button, **F2** = side (lock) button |
 | Mouse | USB mice with the native iPadOS pointer; buttons, wheel (report descriptor parsed) |
+| Network | **Internet through an iPhone's Personal Hotspot over USB** (Apple USB Ethernet, like Linux `ipheth`): the link appears as `en1` / "Ethernet" in Settings, iPadOS does DHCP, routing and DNS itself, Safari loads pages. No pairing needed |
 | Power button | The Pi's power button is the iPad side button (lock/wake); holding it still cuts power in hardware |
 | Device identity | iPad (6th generation), Wi-Fi (`iPad7,5` / `J71bAP`) userland; About shows Model Name "Raspberry Pi 5", Model Number "RPI5" and the board's own serial number |
 | Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
@@ -30,7 +31,7 @@ As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on
 
 ## What does not work (yet)
 
-- **No Wi-Fi, Bluetooth, Ethernet, audio or camera.** The Wi-Fi switch does nothing; Bluetooth is greyed out (its daemon is disabled).
+- **No Wi-Fi, Bluetooth, the Pi's own Ethernet port, audio or camera.** The Wi-Fi switch does nothing; Bluetooth is greyed out (its daemon is disabled). Internet works through an iPhone instead (see Network above).
 - **No GPU.** Widgets show as white tiles, translucent "material" backgrounds (the dock) come and go, and everything is slower than it should be.
 - **Some apps and pages crash:** Photos (assetsd), Settings → General → iPad Storage (volume capacity on HFS+), Settings → Screen Time.
 - **USB hubs** are not supported: plug the keyboard and mouse straight into the Pi.
