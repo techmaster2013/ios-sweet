@@ -1,203 +1,170 @@
-# ios-sweet
+# ipados-rpi5
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+**Apple's iPadOS 16 running on a Raspberry Pi 5.**
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+This project boots Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) on a Raspberry Pi 5, with the **unmodified iPadOS 16.6.1 (20G81) userland of the iPad (6th generation)** on top: launchd, the system daemons, backboardd, SpringBoard and the stock apps. It is built on [ios-sweet](https://github.com/dipa-studio/ios-sweet), which did the same for the Redmi Note 10 Pro; that project's README is kept in [docs/README-sweet.md](docs/README-sweet.md).
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on HDMI**, in landscape. A USB keyboard and mouse work: you can unlock it, open apps (Settings, Messages, Safari, the App Library) and type. Rendering runs entirely on the CPU; there is no GPU driver.
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
+> Experimental bring-up, not a usable tablet OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. Do not put anything personal on it.
 
 ## What works
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
+| Boot | Pi firmware → our shim (`ios-pi5-shim.img`) → XNU. The Pi's EEPROM and firmware are untouched |
+| CPU | All 4 Cortex-A76 cores (PSCI), GICv2 (GIC-400) interrupts and IPIs, 16K pages |
+| Memory | 3 GiB for XNU on 4/8/16 GB boards (about 1 GiB on 2 GB boards) |
+| Storage | Own SD host (SDHCI) driver; the iPadOS root is a journaled HFS+ volume on SD partition 3, read/write |
+| iPadOS userland | Real iPadOS 16.6.1 root filesystem and shared cache; launchd and the system daemons run |
+| Display | The firmware's HDMI framebuffer, presented to iPadOS at its native size (1920×1080 here); CoreAnimation renders in software |
+| GUI | backboardd, SpringBoard, lock screen, home screen, dock, App Library, Settings, Messages, Safari |
+| Keyboard | USB keyboards (boot protocol) through our own xHCI driver for RP1's USB controllers. **Esc** or **F1** = Home button, **F2** = side (lock) button |
+| Mouse | USB mice with the native iPadOS pointer; buttons, wheel (report descriptor parsed) |
+| Power button | The Pi's power button is the iPad side button (lock/wake); holding it still cuts power in hardware |
+| Device identity | iPad (6th generation), Wi-Fi (`iPad7,5` / `J71bAP`) userland; About shows Model Name "Raspberry Pi 5", Model Number "RPI5" and the board's own serial number |
 | Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
+| Debugging | Every console line (kernel and daemons) is saved to a log partition on the SD card |
 
 ## What does not work (yet)
 
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
+- **No Wi-Fi, Bluetooth, Ethernet, audio or camera.** The Wi-Fi switch does nothing; Bluetooth is greyed out (its daemon is disabled).
+- **No GPU.** Widgets show as white tiles, translucent "material" backgrounds (the dock) come and go, and everything is slower than it should be.
+- **Some apps and pages crash:** Photos (assetsd), Settings → General → iPad Storage (volume capacity on HFS+), Settings → Screen Time.
+- **USB hubs** are not supported: plug the keyboard and mouse straight into the Pi.
+- **The clock** starts from the time the payload was built (no RTC driver, no network time).
+- **Slow storage:** the SD card runs at 25 MHz with CPU-copied (PIO) transfers, so apps take a while to open.
+- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection.
 
 ## How it boots
 
 ```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
+Pi 5 firmware (EEPROM bootloader + start firmware, stock)
+  config.txt: kernel=ios-pi5-shim.img, initramfs payload.bin followkernel, pciex4_reset=0
+    └─ shim-pi5: entered at EL2, drops to EL1, reads the firmware device tree and
+       patches the Apple device tree with this board's serial, RAM and framebuffer
+         └─ XNU (MACHINE_CONFIG=SWEET, SWEET_BOARD_PI5): GICv2, PL011 UART, 4 CPUs
+              ├─ bsd/dev/sweet_sd.c:   SD card, root = MBR partition type 0xAF (rd=sdroot0)
+              ├─ bsd/dev/sweet_xhci.c: RP1 PCIe setup, xHCI, USB HID keyboard/mouse
+              └─ HFS+ root → launchd → backboardd → SpringBoard
 ```
 
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
+SD card layout (MBR):
+
+| Partition | Type | Contents |
+| --- | --- | --- |
+| 1 | FAT32 (0x0c) | Pi firmware, `config.txt`, `ios-pi5-shim.img`, `payload.bin` (kernel + device tree + boot-args) |
+| 2 | Linux (0x83) | Raspberry Pi OS root, unused |
+| 3 | HFS+ (0xAF) | iPadOS 16.6.1 root, 16 GiB |
+| 4 | 0xDA | 64 MiB console log ring (`SWEETLOG`) |
 
 ## How to do it yourself
 
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
-
-### 0. Back up the phone
-
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
-
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
-
-```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
-```
+You need a Raspberry Pi 5 (developed on the 8 GB model; the shim adapts RAM and display to the others), a microSD card of 32 GB or more with Raspberry Pi OS on it, an HDMI display, a USB keyboard and mouse, and the iPadOS 16.6.1 (20G81) IPSW for iPad7,5 (`iPad_64bit_TouchID_ASTC_16.6.1_20G81_Restore.ipsw`), which you download from Apple yourself. iPadOS is Apple's and is not distributed here.
 
 ### 1. Build the kernel
 
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
+The kernel builds on GitHub Actions (a macOS runner with Xcode): run the **xnu** workflow with `board=pi5`. It applies the patches in [xnu/patches](xnu/patches) to xnu-8796.141.3 and produces `kernel.development.sweet`.
 
-```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
+### 2. Build the shim
+
+```bash
+shim-pi5/build.sh
 ```
 
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
+Needs `gcc-aarch64-linux-gnu`. Produces `shim-pi5/out/ios-pi5-shim.img`.
 
-### 2. Build the iOS root image
+### 3. Build the iPadOS root image
 
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
+On Linux (WSL2 works; [tools/wsl-hfsplus.sh](tools/wsl-hfsplus.sh) builds the HFS+ module WSL lacks), with `apfs-fuse`, `hfsprogs` and `rsync`:
 
-```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
+```bash
+tools/mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg ipados-root.img 16G
 ```
 
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
+The three images are the IPSW's OS (`096-56598-083.dmg`), `Cryptex1,SystemOS` and `Cryptex1,AppOS` disk images. Then mount the image read-write (`mount -t hfsplus -o loop,force`) and apply the bring-up changes (skip Setup and data migration, remove CommCenter, no panic on daemon crashes, …):
 
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
-
-```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
+```bash
+SWEET_BUILD=20G81 SWEET_VERSION=16.6.1 sudo tools/sweet-root-tweaks.py /mnt/ipados-root
 ```
 
-### 3. Build the boot image
+### 4. Build the payload
 
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
-
-```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
+```bash
+python3 tools/mkadt_pi5.py pi5.adt
+python3 tools/mkpayload.py kernel.development.sweet pi5.adt payload.bin --cmdline \
+  "debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress -v rd=sdroot0 sdrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweettime=$(date +%s)"
 ```
 
-What the less obvious boot-args do:
+### 5. Set up the SD card
 
-| Boot-arg | Effect |
+- Copy `ios-pi5-shim.img` and `payload.bin` to the boot (FAT) partition and add to the end of `config.txt`:
+
+  ```
+  [all]
+  kernel=ios-pi5-shim.img
+  initramfs payload.bin followkernel
+  arm_64bit=1
+  os_check=0
+  enable_uart=1
+  uart_2ndstage=1
+  framebuffer_depth=32
+  disable_overscan=1
+  pciex4_reset=0
+  ```
+
+  (Delete these lines to boot Raspberry Pi OS again.)
+- Create partition 3 (type `0xAF`, 16 GiB) right after the Raspberry Pi OS partition and write the root image into it raw.
+- Optionally create partition 4 (type `0xDA`, 64 MiB) for the console log.
+
+### 6. Read the log
+
+After a boot, copy the first 4 KiB + 4 MiB of partition 4 to a file and decode it:
+
+```bash
+python3 tools/sweet-log.py log-area.bin boot.txt
+```
+
+## Boot arguments
+
+| Argument | Meaning |
 | --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
-
-### 4. Flash the root and boot
-
-```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
-```
-
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
-
-### 5. Read the kernel log
-
-```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
-```
-
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
-
-### QEMU
-
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
+| `rd=sdroot0` | Root on the SD card's HFS+ partition |
+| `sdrw=1`, `rootrw=1` | Allow writes to that partition; mount the root read-write (needed: the journal is set up on first mount) |
+| `sdpart=N` | Use MBR partition N instead of the first type-0xAF one |
+| `sdlog=0`, `sdlogsecs=N` | Disable the SD console log; flush interval (default 2 s) |
+| `sweetfb_noconsole=1` | Stop drawing kernel text once iPadOS draws its first frame (still logged) |
+| `sweettime=SECONDS` | Initial Unix time for the clock (no RTC driver yet) |
+| `xhci=0` | Disable the USB driver |
+| `xhcidebug=1` | Log every USB report and interface |
+| `xhciscroll=N` | Scale (negative: invert) the mouse wheel |
+| `sweethidtest=N` | Press Home every N seconds (input-free testing) |
 
 ## Repository layout
 
-| Path | What |
+| Path | Contents |
 | --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
-
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
-
-## Kernel patches
-
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
+| [xnu/patches](xnu/patches) | Kernel patches: `0001`–`0081` from ios-sweet, `0101-pi5-board-gicv2.patch` for the Pi 5 (GICv2, SMP, SD, USB, HID, …) |
+| [shim-pi5](shim-pi5) | Pi 5 boot shim (stage-1 hardware checks without a payload, XNU loader with one) |
+| [tools](tools) | Device tree (`mkadt_pi5.py`), payload, root image, root tweaks, log decoder |
+| [PI5-PORT.md](PI5-PORT.md) | Detailed Pi 5 port notes: hardware facts, boot logs, what was tried |
+| [NOTES.md](NOTES.md) | The phone port's development notes |
+| `shim`, `site`, `docs` | The phone port's boot shim, website and docs |
 
 ## Key hardware facts
 
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
-
-More in [`NOTES.md`](NOTES.md).
+| | |
+| --- | --- |
+| SoC | Broadcom BCM2712, 4× Cortex-A76 (r4p1), MPIDR 0x81000n00 |
+| Interrupts | GIC-400 (GICv2): GICD 0x107fff9000, GICC 0x107fffa000 |
+| Timer | 54 MHz, virtual timer PPI 27 |
+| UART | PL011 at 0x107d001000 (3-pin debug header) |
+| SD | brcm,bcm2712-sdhci at 0x107cfff000 (+ cfg 0x107cfff400), 200 MHz base clock |
+| USB | RP1 (PCIe x4) DWC3 xHCI ×2 at RP1 BAR1 + 0x200000/0x300000; the firmware maps RP1 at CPU 0x1c00000000 → PCI 0x80000000 |
+| Power button | GPIO 20 of the brcmstb GPIO block at 0x107d508500, active low |
 
 ## Credits
 
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Built on [ios-sweet](https://github.com/dipa-studio/ios-sweet) by dipa-studio and everything it credits: Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw). Pi 5 hardware details come from the Raspberry Pi firmware's device trees and the published Linux drivers; [apfs-fuse](https://github.com/sgan81/apfs-fuse) reads the IPSW's images. iPadOS itself is Apple's and is not distributed here.
+
+MIT License, see [LICENSE](LICENSE).
