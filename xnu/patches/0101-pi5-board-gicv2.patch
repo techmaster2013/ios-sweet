@@ -1,21 +1,22 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 6630131..7e73d5f 100644
+index 6630131..468b01d 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
  
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/sweet_sd.c			standard
++bsd/dev/sweet_xhci.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
 new file mode 100644
-index 0000000..687d005
+index 0000000..2e545f3
 --- /dev/null
 +++ b/bsd/dev/sweet_sd.c
-@@ -0,0 +1,828 @@
+@@ -0,0 +1,830 @@
 +/*
 + * SWEET (Raspberry Pi 5) SD card root device.
 + *
@@ -62,6 +63,7 @@ index 0000000..687d005
 +extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
 +extern uint64_t sweet_log_position(void);
 +static void sweet_sd_log_start(void);
++extern void sweet_xhci_start(void);
 +
 +/* SDHCI registers, all accessed as aligned 32-bit words. */
 +#define SD_BLK          0x04    /* [11:0] block size, [31:16] block count */
@@ -711,6 +713,7 @@ index 0000000..687d005
 +	printf("SWEET SD: root partition at block %llu, %llu MiB, %s\n",
 +	    sd.first_block, sd.nblocks >> 11, sd.writable ? "read-write" : "read-only");
 +	sweet_sd_log_start();
++	sweet_xhci_start();             /* USB keyboard/mouse (bsd/dev/sweet_xhci.c) */
 +	return 0;
 +}
 +
@@ -842,6 +845,925 @@ index 0000000..687d005
 +	}
 +	*dev = sd.bdev;
 +	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
+new file mode 100644
+index 0000000..f4146bb
+--- /dev/null
++++ b/bsd/dev/sweet_xhci.c
+@@ -0,0 +1,913 @@
++/*
++ * SWEET (Raspberry Pi 5) USB keyboard and mouse.
++ *
++ * The Pi 5 USB ports are on RP1, behind the PCIe x4 link the firmware brings
++ * up (config.txt pciex4_reset=0 keeps it, with RP1's BAR at CPU 0x1f00000000).
++ * RP1 has two DWC3 controllers in xHCI host mode (ADT /sweet-xhci reg). This
++ * driver resets each one, then from one polling thread (no interrupts):
++ *
++ *   - enumerates devices on the root ports (no hubs yet), also on hotplug;
++ *   - for every HID boot interface (keyboard, mouse) switches it to the boot
++ *     protocol and keeps one interrupt-IN transfer queued;
++ *   - turns reports into iPadOS HID events (iokit/Kernel/arm/hid/SweetHID.cpp):
++ *     keyboard usages to SweetHIDKeyboard, mouse motion/buttons/wheel to
++ *     SweetHIDPointer. F1 is the Home button, F2 the side (lock) button.
++ *
++ * DMA memory is one physically contiguous cacheable allocation; every
++ * structure is cleaned+invalidated (dsync) right after the CPU writes it and
++ * before the CPU reads what the controller wrote, so it works whether or not
++ * the PCIe path is coherent. RP1 sees host memory at PA + dma-offset
++ * (0x10_0000_0000 on the Pi 5).
++ * Boot-args: xhci=0 disables the driver, xhcidebug=1 logs every report.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void IOSleep(unsigned milliseconds);
++/* iokit/Kernel/arm/hid/SweetHID.cpp */
++extern void sweet_hid_kbd(unsigned page, unsigned usage, int down);
++extern void sweet_hid_pointer(int dx, int dy, unsigned buttons, int wheel, int hwheel);
++extern void sweet_hid_key(int key, int down);
++
++/* Capability registers */
++#define CAP_LENGTH      0x00
++#define CAP_HCSPARAMS1  0x04
++#define CAP_HCSPARAMS2  0x08
++#define CAP_HCCPARAMS1  0x10
++#define CAP_DBOFF       0x14
++#define CAP_RTSOFF      0x18
++/* Operational registers */
++#define OP_USBCMD       0x00
++#define OP_USBSTS       0x04
++#define OP_PAGESIZE     0x08
++#define OP_CRCR         0x18
++#define OP_DCBAAP       0x30
++#define OP_CONFIG       0x38
++#define OP_PORTSC(n)    (0x400 + 0x10 * ((n) - 1))
++#define CMD_RS          (1u << 0)
++#define CMD_HCRST       (1u << 1)
++#define STS_HCH         (1u << 0)
++#define STS_CNR         (1u << 11)
++/* PORTSC */
++#define PS_CCS          (1u << 0)
++#define PS_PED          (1u << 1)
++#define PS_PR           (1u << 4)
++#define PS_PP           (1u << 9)
++#define PS_CSC          (1u << 17)
++#define PS_PRC          (1u << 21)
++#define PS_CHANGES      (0x7fu << 17)
++#define PS_KEEP         ((1u << 0) | (1u << 3) | (0xfu << 10) | (1u << 24) | (1u << 30) | \
++	                 (0xfu << 5) | (1u << 9) | (3u << 14) | (7u << 25))
++/* Interrupter 0 (runtime base + 0x20) */
++#define IR_IMAN         0x20
++#define IR_ERSTSZ       0x28
++#define IR_ERSTBA       0x30
++#define IR_ERDP         0x38
++/* DWC3 global control */
++#define DWC3_GCTL       0xc110
++
++/* TRB types */
++#define TRB_NORMAL      1
++#define TRB_SETUP       2
++#define TRB_DATA        3
++#define TRB_STATUS      4
++#define TRB_LINK        6
++#define TRB_ENABLE_SLOT 9
++#define TRB_DISABLE_SLOT 10
++#define TRB_ADDRESS_DEV 11
++#define TRB_CONFIG_EP   12
++#define TRB_EVAL_CTX    13
++#define TRB_EV_TRANSFER 32
++#define TRB_EV_CMD      33
++#define TRB_EV_PORT     34
++#define TRB_C           (1u << 0)
++#define TRB_TC          (1u << 1)       /* link: toggle cycle */
++#define TRB_ISP         (1u << 2)
++#define TRB_IOC         (1u << 5)
++#define TRB_IDT         (1u << 6)
++#define TRB_TYPE(t)     ((uint32_t)(t) << 10)
++#define CC_SUCCESS      1
++#define CC_SHORT        13
++
++struct trb {
++	uint32_t p0, p1, status, ctrl;
++};
++
++#define MAX_HC          2
++#define MAX_DEV         4               /* per controller */
++#define MAX_HID         2               /* HID interfaces per device */
++#define CMD_TRBS        64
++#define EVT_TRBS        256
++#define EP0_TRBS        64
++#define INT_TRBS        32
++
++/* DMA layout (offsets in the per-controller allocation) */
++#define D_DCBAA         0x0000          /* 256 x u64 */
++#define D_ERST          0x0800
++#define D_CMD           0x1000
++#define D_EVT           0x2000
++#define D_SPARR         0x3000          /* scratchpad pointer array (<= 256) */
++#define D_DEV(d)        (0x4000 + (d) * 0x3000)
++#define DV_IN           0x0000          /* input context (<= 33 x 64) */
++#define DV_OUT          0x1000          /* device context (32 x 64) */
++#define DV_EP0          0x1800
++#define DV_INT(i)       (0x1c00 + (i) * 0x200)
++#define DV_BUF          0x2000          /* control transfer data, 1 KiB */
++#define DV_REP(i)       (0x2400 + (i) * 0x40)
++#define D_SP            (D_DEV(MAX_DEV))        /* scratchpad pages */
++
++struct ring {
++	struct trb *t;
++	uint64_t dma;
++	uint32_t n, enq;
++	uint32_t pcs;
++};
++
++struct hid_if {
++	bool used;
++	uint8_t iface, proto;           /* 1 keyboard, 2 mouse */
++	uint8_t ep, dci;
++	uint16_t mps;
++	struct ring ring;
++	uint8_t *rep;
++	uint64_t rep_dma;
++	uint8_t last[8];
++};
++
++struct dev {
++	bool used;
++	uint8_t slot, port, speed;
++	uint8_t *base;
++	uint64_t base_dma;
++	struct ring ep0;
++	struct hid_if hid[MAX_HID];
++};
++
++struct hc {
++	vm_offset_t regs, op, rt, db;
++	uint8_t *dma;
++	uint64_t dma_pa, dma_size;
++	uint32_t ports, slots, ctxsz, sp;
++	struct ring cmd;
++	struct trb *evt;
++	uint64_t evt_dma;
++	uint32_t evt_deq, ccs;
++	/* completions the waiters look for */
++	bool cmd_done;
++	uint32_t cmd_cc, cmd_slot;
++	bool xfer_done;
++	uint32_t xfer_cc, xfer_slot, xfer_rem;
++	bool rescan;
++	struct dev dev[MAX_DEV];
++	int idx;
++};
++
++static struct hc hcs[MAX_HC];
++static int nhc;
++static uint64_t dma_off;
++static uint32_t xdebug;
++
++static inline uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static inline void
++wr64(vm_offset_t base, uint32_t off, uint64_t v)
++{
++	wr32(base, off, (uint32_t)v);
++	wr32(base, off + 4, (uint32_t)(v >> 32));
++}
++
++static inline uint64_t
++dma_of(struct hc *h, const void *p)
++{
++	return h->dma_pa + (uint64_t)((const uint8_t *)p - h->dma) + dma_off;
++}
++
++/* Clean+invalidate a DMA structure (CPU writes out, stale lines dropped). */
++static void
++dsync(struct hc *h, const void *p, size_t len)
++{
++	flush_dcache64((addr64_t)(h->dma_pa + (uint64_t)((const uint8_t *)p - h->dma)), (unsigned)len, TRUE);
++}
++
++static void
++ring_init(struct hc *h, struct ring *r, void *mem, uint32_t n)
++{
++	r->t = mem;
++	r->n = n;
++	r->enq = 0;
++	r->pcs = 1;
++	r->dma = dma_of(h, mem);
++	bzero(mem, n * sizeof(struct trb));
++	struct trb *link = &r->t[n - 1];
++	link->p0 = (uint32_t)r->dma;
++	link->p1 = (uint32_t)(r->dma >> 32);
++	link->ctrl = TRB_TYPE(TRB_LINK) | TRB_TC;       /* cycle 0: not yet owned */
++	dsync(h, mem, n * sizeof(struct trb));
++}
++
++/* Queue one TRB; returns its DMA address. */
++static uint64_t
++ring_put(struct hc *h, struct ring *r, uint32_t p0, uint32_t p1, uint32_t status, uint32_t ctrl)
++{
++	struct trb *t = &r->t[r->enq];
++	uint64_t at = r->dma + (uint64_t)r->enq * sizeof(struct trb);
++	t->p0 = p0;
++	t->p1 = p1;
++	t->status = status;
++	__builtin_arm_dmb(0xb);
++	t->ctrl = (ctrl & ~TRB_C) | r->pcs;
++	dsync(h, t, sizeof(*t));
++	if (++r->enq == r->n - 1) {
++		struct trb *link = &r->t[r->n - 1];
++		__builtin_arm_dmb(0xb);
++		link->ctrl = (link->ctrl & ~TRB_C) | r->pcs;
++		dsync(h, link, sizeof(*link));
++		r->pcs ^= 1;
++		r->enq = 0;
++	}
++	return at;
++}
++
++static void
++doorbell(struct hc *h, uint32_t slot, uint32_t target)
++{
++	__builtin_arm_dsb(0xf);
++	wr32(h->db, 4 * slot, target);
++}
++
++static struct dev *
++dev_by_slot(struct hc *h, uint32_t slot)
++{
++	for (int i = 0; i < MAX_DEV; i++) {
++		if (h->dev[i].used && h->dev[i].slot == slot) {
++			return &h->dev[i];
++		}
++	}
++	return NULL;
++}
++
++static void hid_report(struct hc *h, struct dev *d, struct hid_if *hi, uint32_t len);
++
++/* Drain the event ring. */
++static void
++poll_events(struct hc *h)
++{
++	bool any = false;
++	for (;;) {
++		struct trb *e = &h->evt[h->evt_deq];
++		dsync(h, e, sizeof(*e));
++		uint32_t ctrl = e->ctrl;
++		if ((ctrl & TRB_C) != h->ccs) {
++			break;
++		}
++		__builtin_arm_dmb(0xb);
++		uint32_t type = (ctrl >> 10) & 0x3f, cc = e->status >> 24;
++		uint32_t slot = ctrl >> 24;
++		switch (type) {
++		case TRB_EV_CMD:
++			h->cmd_cc = cc;
++			h->cmd_slot = slot;
++			h->cmd_done = true;
++			break;
++		case TRB_EV_TRANSFER: {
++			uint32_t epid = (ctrl >> 16) & 0x1f;
++			struct dev *d = dev_by_slot(h, slot);
++			if (epid == 1) {
++				h->xfer_cc = cc;
++				h->xfer_slot = slot;
++				h->xfer_rem = e->status & 0xffffff;
++				h->xfer_done = true;
++			} else if (d) {
++				for (int i = 0; i < MAX_HID; i++) {
++					struct hid_if *hi = &d->hid[i];
++					if (hi->used && hi->dci == epid) {
++						uint32_t len = hi->mps - MIN(e->status & 0xffffff, hi->mps);
++						if (cc == CC_SUCCESS || cc == CC_SHORT) {
++							hid_report(h, d, hi, len);
++						} else if (xdebug) {
++							printf("SWEET USB: hc%d slot %u ep %u completion %u\n", h->idx, slot, epid, cc);
++						}
++						/* Re-arm (also after an error, so input keeps flowing). */
++						ring_put(h, &hi->ring, (uint32_t)hi->rep_dma, (uint32_t)(hi->rep_dma >> 32),
++						    hi->mps, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
++						doorbell(h, d->slot, hi->dci);
++					}
++				}
++			}
++			break;
++		}
++		case TRB_EV_PORT:
++			h->rescan = true;
++			break;
++		default:
++			break;
++		}
++		any = true;
++		if (++h->evt_deq == EVT_TRBS) {
++			h->evt_deq = 0;
++			h->ccs ^= 1;
++		}
++	}
++	if (any) {
++		wr64(h->rt, IR_ERDP, (h->evt_dma + (uint64_t)h->evt_deq * sizeof(struct trb)) | (1u << 3));
++	}
++}
++
++static int
++wait_flag(struct hc *h, bool *flag, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		poll_events(h);
++		if (*flag) {
++			return 0;
++		}
++		delay(100);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++command(struct hc *h, uint32_t p0, uint32_t p1, uint32_t ctrl, uint32_t *slot_out)
++{
++	h->cmd_done = false;
++	dsync(h, h->dma, D_SP);         /* contexts, DCBAA: written by the CPU just now */
++	ring_put(h, &h->cmd, p0, p1, 0, ctrl);
++	doorbell(h, 0, 0);
++	if (wait_flag(h, &h->cmd_done, 1000)) {
++		printf("SWEET USB: hc%d command type %u timed out\n", h->idx, (ctrl >> 10) & 0x3f);
++		return ETIMEDOUT;
++	}
++	if (h->cmd_cc != CC_SUCCESS) {
++		printf("SWEET USB: hc%d command type %u failed: completion %u\n",
++		    h->idx, (ctrl >> 10) & 0x3f, h->cmd_cc);
++		return EIO;
++	}
++	if (slot_out) {
++		*slot_out = h->cmd_slot;
++	}
++	return 0;
++}
++
++/* Control transfer on EP0; IN data lands in the device's DV_BUF. */
++static int
++control(struct hc *h, struct dev *d, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx,
++    uint16_t len, uint32_t *got)
++{
++	bool in = (rt & 0x80) != 0;
++	uint32_t setup0 = rt | (uint32_t)req << 8 | (uint32_t)val << 16;
++	uint32_t setup1 = idx | (uint32_t)len << 16;
++	uint32_t trt = len ? (in ? 3u : 2u) : 0u;
++	uint64_t buf = d->base_dma + DV_BUF;
++
++	if (len) {
++		dsync(h, d->base + DV_BUF, len);
++	}
++	h->xfer_done = false;
++	ring_put(h, &d->ep0, setup0, setup1, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | trt << 16);
++	if (len) {
++		ring_put(h, &d->ep0, (uint32_t)buf, (uint32_t)(buf >> 32), len,
++		    TRB_TYPE(TRB_DATA) | (in ? 1u << 16 : 0));
++	}
++	ring_put(h, &d->ep0, 0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC | ((len && in) ? 0 : 1u << 16));
++	doorbell(h, d->slot, 1);
++	/*
++	 * Only the status TRB asks for an event; an error (or a short packet) in
++	 * an earlier stage reports one too, and then the status event follows.
++	 */
++	for (int stage = 0; stage < 3; stage++) {
++		if (wait_flag(h, &h->xfer_done, 1000)) {
++			printf("SWEET USB: hc%d slot %u control 0x%02x/0x%02x timed out\n", h->idx, d->slot, rt, req);
++			return ETIMEDOUT;
++		}
++		if (h->xfer_cc == CC_SUCCESS) {
++			break;
++		}
++		if (h->xfer_cc != CC_SHORT) {
++			if (xdebug || req == 6) {
++				printf("SWEET USB: hc%d slot %u control 0x%02x/0x%02x completion %u\n",
++				    h->idx, d->slot, rt, req, h->xfer_cc);
++			}
++			return EIO;
++		}
++		h->xfer_done = false;
++	}
++	if (len) {
++		dsync(h, d->base + DV_BUF, len);        /* drop lines fetched during the transfer */
++	}
++	if (got) {
++		*got = len;
++	}
++	return 0;
++}
++
++static uint32_t *
++ctx(struct hc *h, uint8_t *base, uint32_t index)
++{
++	return (uint32_t *)(base + index * h->ctxsz);
++}
++
++static void
++dev_free(struct hc *h, struct dev *d)
++{
++	if (d->slot) {
++		(void)command(h, 0, 0, TRB_TYPE(TRB_DISABLE_SLOT) | (uint32_t)d->slot << 24, NULL);
++		((uint64_t *)(h->dma + D_DCBAA))[d->slot] = 0;
++	}
++	bzero(d, sizeof(*d));
++}
++
++/* Interval for an interrupt endpoint context (2^n x 125 us). */
++static uint32_t
++ep_interval(uint8_t speed, uint8_t binterval)
++{
++	if (speed >= 3) {               /* high/super speed: bInterval is already 2^(n-1) frames */
++		return MIN(MAX(binterval, 1) - 1u, 15u);
++	}
++	uint32_t uframes = MAX(binterval, 1) * 8u, n = 0;
++	while ((2u << n) <= uframes && n < 10) {
++		n++;
++	}
++	return MAX(n, 3u);
++}
++
++static void
++enumerate(struct hc *h, uint32_t port)
++{
++	uint32_t ps = rd32(h->op, OP_PORTSC(port));
++	if (!(ps & PS_CCS)) {
++		return;
++	}
++	for (int i = 0; i < MAX_DEV; i++) {
++		if (h->dev[i].used && h->dev[i].port == port) {
++			return;
++		}
++	}
++	if (!(ps & PS_PED)) {
++		/* USB 2 port: reset it to enable. */
++		wr32(h->op, OP_PORTSC(port), (ps & PS_KEEP) | PS_PR);
++		for (int i = 0; i < 500 && !(rd32(h->op, OP_PORTSC(port)) & PS_PRC); i++) {
++			delay(1000);
++		}
++		ps = rd32(h->op, OP_PORTSC(port));
++		wr32(h->op, OP_PORTSC(port), (ps & PS_KEEP) | PS_PRC);
++		IOSleep(20);
++		ps = rd32(h->op, OP_PORTSC(port));
++		if (!(ps & PS_PED)) {
++			printf("SWEET USB: hc%d port %u did not enable (portsc 0x%x)\n", h->idx, port, ps);
++			return;
++		}
++	}
++	uint8_t speed = (ps >> 10) & 0xf;
++	int di = -1;
++	for (int i = 0; i < MAX_DEV; i++) {
++		if (!h->dev[i].used) {
++			di = i;
++			break;
++		}
++	}
++	if (di < 0) {
++		return;
++	}
++	struct dev *d = &h->dev[di];
++	bzero(d, sizeof(*d));
++	d->used = true;
++	d->port = (uint8_t)port;
++	d->speed = speed;
++	d->base = h->dma + D_DEV(di);
++	d->base_dma = dma_of(h, d->base);
++	bzero(d->base, 0x3000);
++
++	uint32_t slot;
++	if (command(h, 0, 0, TRB_TYPE(TRB_ENABLE_SLOT), &slot) || slot == 0 || slot > h->slots) {
++		d->used = false;
++		return;
++	}
++	d->slot = (uint8_t)slot;
++	((uint64_t *)(h->dma + D_DCBAA))[slot] = d->base_dma + DV_OUT;
++	ring_init(h, &d->ep0, d->base + DV_EP0, EP0_TRBS);
++
++	/* Input context: A0 (slot) + A1 (EP0). */
++	uint8_t *in = d->base + DV_IN;
++	uint32_t mps0 = speed == 2 ? 8 : speed == 1 ? 8 : speed == 3 ? 64 : 512;
++	ctx(h, in, 0)[1] = 0x3;
++	uint32_t *sc = ctx(h, in, 1);
++	sc[0] = (1u << 27) | ((uint32_t)speed << 20);
++	sc[1] = port << 16;
++	uint32_t *e0 = ctx(h, in, 2);
++	e0[1] = (3u << 1) | (4u << 3) | (mps0 << 16);
++	e0[2] = (uint32_t)d->ep0.dma | 1;
++	e0[3] = (uint32_t)(d->ep0.dma >> 32);
++	e0[4] = 8;
++	uint64_t in_dma = d->base_dma + DV_IN;
++	if (command(h, (uint32_t)in_dma, (uint32_t)(in_dma >> 32), TRB_TYPE(TRB_ADDRESS_DEV) | slot << 24, NULL)) {
++		dev_free(h, d);
++		return;
++	}
++	IOSleep(10);
++
++	uint8_t *buf = d->base + DV_BUF;
++	uint32_t got = 0;
++	if (control(h, d, 0x80, 6, 0x0100, 0, 8, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	if (buf[7] && buf[7] != mps0) {
++		mps0 = buf[7] == 9 ? 512 : buf[7];
++		ctx(h, in, 0)[1] = 0x2;
++		e0[1] = (3u << 1) | (4u << 3) | (mps0 << 16);
++		(void)command(h, (uint32_t)in_dma, (uint32_t)(in_dma >> 32), TRB_TYPE(TRB_EVAL_CTX) | slot << 24, NULL);
++	}
++	got = 0;
++	if (control(h, d, 0x80, 6, 0x0100, 0, 18, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	uint16_t vid = (uint16_t)(buf[8] | buf[9] << 8), pid = (uint16_t)(buf[10] | buf[11] << 8);
++	uint8_t dclass = buf[4];
++	printf("SWEET USB: hc%d port %u: device %04x:%04x class %u speed %u slot %u mps0 %u\n",
++	    h->idx, port, vid, pid, dclass, speed, slot, mps0);
++	if (dclass == 9) {
++		printf("SWEET USB: hubs are not supported yet: plug the keyboard/mouse in directly\n");
++		dev_free(h, d);
++		return;
++	}
++	got = 0;
++	if (control(h, d, 0x80, 6, 0x0200, 0, 9, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	uint16_t total = (uint16_t)MIN((uint32_t)(buf[2] | buf[3] << 8), 1024u);
++	uint8_t cfgval = buf[5];
++	got = 0;
++	if (control(h, d, 0x80, 6, 0x0200, 0, total, &got)) {
++		dev_free(h, d);
++		return;
++	}
++	/* Parse: HID boot interfaces and their interrupt IN endpoint. */
++	int nh = 0, cur = -1;
++	uint8_t cfg[1024];
++	memcpy(cfg, buf, total);
++	for (uint32_t off = 0; off + 2 <= total && cfg[off] >= 2; off += cfg[off]) {
++		const uint8_t *x = &cfg[off];
++		if (x[1] == 4 && x[0] >= 9) {           /* interface */
++			cur = -1;
++			if (x[5] == 3 && x[6] == 1 && (x[7] == 1 || x[7] == 2) && nh < MAX_HID) {
++				cur = nh++;
++				d->hid[cur].iface = x[2];
++				d->hid[cur].proto = x[7];
++			}
++		} else if (x[1] == 5 && x[0] >= 7 && cur >= 0 && !d->hid[cur].used) {
++			if ((x[2] & 0x80) && (x[3] & 3) == 3) {     /* interrupt IN */
++				struct hid_if *hi = &d->hid[cur];
++				hi->ep = x[2] & 0xf;
++				hi->dci = (uint8_t)(2 * hi->ep + 1);
++				hi->mps = (uint16_t)MIN((uint32_t)(x[4] | (x[5] & 7) << 8), 64u);
++				hi->used = true;
++				uint8_t interval = (uint8_t)ep_interval(speed, x[6]);
++				hi->rep = d->base + DV_REP(cur);
++				hi->rep_dma = d->base_dma + DV_REP(cur);
++				ring_init(h, &hi->ring, d->base + DV_INT(cur), INT_TRBS);
++				uint32_t *ec = ctx(h, in, 1 + hi->dci);
++				bzero(ec, h->ctxsz);
++				ec[0] = (uint32_t)interval << 16;
++				ec[1] = (3u << 1) | (7u << 3) | ((uint32_t)hi->mps << 16);
++				ec[2] = (uint32_t)hi->ring.dma | 1;
++				ec[3] = (uint32_t)(hi->ring.dma >> 32);
++				ec[4] = 8 | ((uint32_t)hi->mps << 16);
++			}
++		}
++	}
++	uint32_t add = 1, maxdci = 1;
++	for (int i = 0; i < MAX_HID; i++) {
++		if (d->hid[i].used) {
++			add |= 1u << d->hid[i].dci;
++			maxdci = MAX(maxdci, d->hid[i].dci);
++		}
++	}
++	if (add == 1) {
++		printf("SWEET USB: hc%d port %u: no HID keyboard/mouse interface\n", h->idx, port);
++		/* Keep the slot so the port is not re-enumerated until unplugged. */
++		return;
++	}
++	if (control(h, d, 0x00, 9, cfgval, 0, 0, NULL)) {
++		dev_free(h, d);
++		return;
++	}
++	ctx(h, in, 0)[0] = 0;
++	ctx(h, in, 0)[1] = add;
++	sc[0] = (sc[0] & ~(0x1fu << 27)) | (maxdci << 27);
++	if (command(h, (uint32_t)in_dma, (uint32_t)(in_dma >> 32), TRB_TYPE(TRB_CONFIG_EP) | slot << 24, NULL)) {
++		dev_free(h, d);
++		return;
++	}
++	for (int i = 0; i < MAX_HID; i++) {
++		struct hid_if *hi = &d->hid[i];
++		if (!hi->used) {
++			continue;
++		}
++		(void)control(h, d, 0x21, 0x0b, 0, hi->iface, 0, NULL);        /* SET_PROTOCOL boot */
++		if (hi->proto == 1) {
++			(void)control(h, d, 0x21, 0x0a, 0, hi->iface, 0, NULL); /* SET_IDLE 0 */
++		}
++		ring_put(h, &hi->ring, (uint32_t)hi->rep_dma, (uint32_t)(hi->rep_dma >> 32), hi->mps,
++		    TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
++		doorbell(h, d->slot, hi->dci);
++		printf("SWEET USB: hc%d port %u: %s on interface %u, endpoint %u\n", h->idx, port,
++		    hi->proto == 1 ? "keyboard" : "mouse", hi->iface, hi->ep);
++	}
++}
++
++/* Keyboard usages that act as iPad buttons instead of keys. */
++static bool
++kbd_special(uint8_t usage, int down)
++{
++	switch (usage) {
++	case 0x3a:      /* F1: Home */
++		sweet_hid_key(3, down);
++		return true;
++	case 0x3b:      /* F2: side button (lock) */
++		sweet_hid_key(0, down);
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool
++contains(const uint8_t *keys, uint8_t k)
++{
++	for (int i = 0; i < 6; i++) {
++		if (keys[i] == k) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++hid_report(struct hc *h, struct dev *d, struct hid_if *hi, uint32_t len)
++{
++	uint8_t r[8] = { 0 };
++	dsync(h, hi->rep, 64);
++	memcpy(r, hi->rep, MIN(len, 8u));
++	if (xdebug) {
++		printf("SWEET USB: hc%d slot %u %s report %u: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    h->idx, d->slot, hi->proto == 1 ? "kbd" : "mouse", len,
++		    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
++	}
++	if (hi->proto == 1) {
++		if (len < 3 || r[2] == 1) {     /* phantom state (rollover) */
++			return;
++		}
++		uint8_t mods = r[0], old = hi->last[0];
++		for (int b = 0; b < 8; b++) {
++			if ((mods ^ old) & (1u << b)) {
++				sweet_hid_kbd(7, 0xe0 + b, (mods >> b) & 1);
++			}
++		}
++		for (int i = 2; i < 8; i++) {   /* released */
++			uint8_t k = hi->last[i];
++			if (k > 3 && !contains(&r[2], k) && !kbd_special(k, 0)) {
++				sweet_hid_kbd(7, k, 0);
++			}
++		}
++		for (int i = 2; i < 8; i++) {   /* pressed */
++			uint8_t k = r[i];
++			if (k > 3 && !contains(&hi->last[2], k) && !kbd_special(k, 1)) {
++				sweet_hid_kbd(7, k, 1);
++			}
++		}
++		memcpy(hi->last, r, 8);
++	} else {
++		if (len < 3) {
++			return;
++		}
++		int wheel = len >= 4 ? (int8_t)r[3] : 0;
++		sweet_hid_pointer((int8_t)r[1], (int8_t)r[2], r[0] & 7, wheel, 0);
++	}
++}
++
++static int
++hc_init(struct hc *h, uint64_t pa, uint64_t size)
++{
++	h->regs = ml_io_map(pa, size);
++	uint32_t ver = rd32(h->regs, CAP_LENGTH);
++	uint32_t gctl = rd32(h->regs, DWC3_GCTL);
++	printf("SWEET USB: hc%d at 0x%llx: caplength/version 0x%08x, DWC3 GCTL 0x%08x\n", h->idx, pa, ver, gctl);
++	if (ver == 0xffffffff || ((ver >> 16) != 0x100 && (ver >> 16) != 0x110 && (ver >> 16) != 0x120)) {
++		printf("SWEET USB: hc%d: no xHCI here\n", h->idx);
++		return ENXIO;
++	}
++	if (((gctl >> 12) & 3) != 1) {
++		wr32(h->regs, DWC3_GCTL, (gctl & ~(3u << 12)) | (1u << 12));
++		IOSleep(10);
++		printf("SWEET USB: hc%d: DWC3 switched to host mode (GCTL 0x%08x)\n", h->idx, rd32(h->regs, DWC3_GCTL));
++	}
++	h->op = h->regs + (ver & 0xff);
++	h->rt = h->regs + (rd32(h->regs, CAP_RTSOFF) & ~0x1fu);
++	h->db = h->regs + (rd32(h->regs, CAP_DBOFF) & ~0x3u);
++	uint32_t p1 = rd32(h->regs, CAP_HCSPARAMS1), p2 = rd32(h->regs, CAP_HCSPARAMS2);
++	uint32_t c1 = rd32(h->regs, CAP_HCCPARAMS1);
++	h->slots = MIN(p1 & 0xff, 64u);
++	h->ports = p1 >> 24;
++	h->ctxsz = (c1 & (1u << 2)) ? 64 : 32;
++	h->sp = ((p2 >> 21) & 0x1f) << 5 | (p2 >> 27);
++	if (!(c1 & 1)) {
++		printf("SWEET USB: hc%d has no 64-bit addressing\n", h->idx);
++		return ENXIO;
++	}
++
++	/* Halt and reset. */
++	wr32(h->op, OP_USBCMD, rd32(h->op, OP_USBCMD) & ~CMD_RS);
++	for (int i = 0; i < 200 && !(rd32(h->op, OP_USBSTS) & STS_HCH); i++) {
++		delay(1000);
++	}
++	wr32(h->op, OP_USBCMD, CMD_HCRST);
++	for (int i = 0; i < 1000 && (rd32(h->op, OP_USBCMD) & CMD_HCRST); i++) {
++		delay(1000);
++	}
++	for (int i = 0; i < 1000 && (rd32(h->op, OP_USBSTS) & STS_CNR); i++) {
++		delay(1000);
++	}
++	if (rd32(h->op, OP_USBSTS) & STS_CNR) {
++		printf("SWEET USB: hc%d not ready after reset (sts 0x%x)\n", h->idx, rd32(h->op, OP_USBSTS));
++		return EIO;
++	}
++
++	/* DMA memory: one contiguous block, used through a write-combined mapping. */
++	uint32_t pagesz = (rd32(h->op, OP_PAGESIZE) & 0xffff) << 12;
++	if (pagesz != 4096 && h->sp) {
++		printf("SWEET USB: hc%d page size %u unsupported\n", h->idx, pagesz);
++		return ENXIO;
++	}
++	h->dma_size = round_page_64(D_SP + (uint64_t)h->sp * 4096);
++	vm_offset_t va;
++	if (kmem_alloc_contig(kernel_map, &va, (vm_size_t)h->dma_size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		return ENOMEM;
++	}
++	h->dma_pa = ptoa_64(pn);
++	h->dma = (uint8_t *)va;
++	bzero(h->dma, (size_t)h->dma_size);
++
++	uint64_t *dcbaa = (uint64_t *)(h->dma + D_DCBAA);
++	if (h->sp) {
++		uint64_t *arr = (uint64_t *)(h->dma + D_SPARR);
++		for (uint32_t i = 0; i < h->sp; i++) {
++			arr[i] = dma_of(h, h->dma + D_SP + i * 4096);
++		}
++		dcbaa[0] = dma_of(h, arr);
++	}
++	wr32(h->op, OP_CONFIG, h->slots);
++	wr64(h->op, OP_DCBAAP, dma_of(h, dcbaa));
++	ring_init(h, &h->cmd, h->dma + D_CMD, CMD_TRBS);
++	wr64(h->op, OP_CRCR, h->cmd.dma | 1);
++	h->evt = (struct trb *)(h->dma + D_EVT);
++	h->evt_dma = dma_of(h, h->evt);
++	h->evt_deq = 0;
++	h->ccs = 1;
++	uint64_t *erst = (uint64_t *)(h->dma + D_ERST);
++	erst[0] = h->evt_dma;
++	erst[1] = EVT_TRBS;
++	dsync(h, h->dma, (size_t)h->dma_size);
++	wr32(h->rt, IR_IMAN, 0);
++	wr32(h->rt, IR_ERSTSZ, 1);
++	wr64(h->rt, IR_ERDP, h->evt_dma);
++	wr64(h->rt, IR_ERSTBA, dma_of(h, erst));
++	__builtin_arm_dsb(0xf);
++	wr32(h->op, OP_USBCMD, CMD_RS);
++	for (int i = 0; i < 100 && (rd32(h->op, OP_USBSTS) & STS_HCH); i++) {
++		delay(1000);
++	}
++	/* Port power (no-op where ports are always powered). */
++	for (uint32_t p = 1; p <= h->ports; p++) {
++		uint32_t ps = rd32(h->op, OP_PORTSC(p));
++		if (!(ps & PS_PP)) {
++			wr32(h->op, OP_PORTSC(p), (ps & PS_KEEP) | PS_PP);
++		}
++	}
++	printf("SWEET USB: hc%d running: %u ports, %u slots, %u-byte contexts, %u scratchpad pages, DMA 0x%llx (+0x%llx)\n",
++	    h->idx, h->ports, h->slots, h->ctxsz, h->sp, h->dma_pa, dma_off);
++	return 0;
++}
++
++static void
++scan(struct hc *h)
++{
++	h->rescan = false;
++	for (uint32_t p = 1; p <= h->ports; p++) {
++		uint32_t ps = rd32(h->op, OP_PORTSC(p));
++		if (ps & PS_CHANGES) {
++			wr32(h->op, OP_PORTSC(p), (ps & PS_KEEP) | (ps & PS_CHANGES));
++		}
++		if (!(ps & PS_CCS)) {
++			for (int i = 0; i < MAX_DEV; i++) {
++				if (h->dev[i].used && h->dev[i].port == p) {
++					printf("SWEET USB: hc%d port %u: device removed\n", h->idx, p);
++					dev_free(h, &h->dev[i]);
++				}
++			}
++			continue;
++		}
++		enumerate(h, p);
++	}
++}
++
++static void
++sweet_xhci_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	IOSleep(2000);          /* power-on settle; the HID services register meanwhile */
++	for (int i = 0; i < nhc; i++) {
++		scan(&hcs[i]);
++	}
++	for (uint32_t tick = 0;; tick++) {
++		for (int i = 0; i < nhc; i++) {
++			struct hc *h = &hcs[i];
++			poll_events(h);
++			/* Hotplug: port change events, plus a slow fallback scan. */
++			if (h->rescan || (tick % 250) == 0) {
++				IOSleep(h->rescan ? 100 : 0);
++				scan(h);
++			}
++		}
++		IOSleep(4);
++	}
++}
++
++void sweet_xhci_start(void);
++
++void
++sweet_xhci_start(void)
++{
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	unsigned int size = 0;
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("xhci", &on, sizeof(on));
++	PE_parse_boot_argn("xhcidebug", &xdebug, sizeof(xdebug));
++	if (!on) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-xhci", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return;
++	}
++	uint64_t const *p = NULL;
++	unsigned int psz = 0;
++	if (SecureDTGetProperty(node, "dma-offset", (void const **)&p, &psz) == kSuccess && psz >= 8) {
++		dma_off = p[0];
++	}
++	PE_parse_boot_argn("xhcidma", &dma_off, sizeof(dma_off));
++	/* RP1 sits behind the PCIe x4 root complex: touch it only with the link up. */
++	if (SecureDTGetProperty(node, "pcie-status", (void const **)&p, &psz) == kSuccess && psz >= 8) {
++		vm_offset_t st = ml_io_map(p[0] & ~(uint64_t)PAGE_MASK, PAGE_SIZE) + (p[0] & PAGE_MASK);
++		uint32_t v = *(volatile uint32_t *)st;
++		printf("SWEET USB: PCIe x4 status 0x%08x\n", v);
++		if ((v & 0x30) != 0x30) {
++			printf("SWEET USB: RP1 PCIe link is down (config.txt pciex4_reset=0?): no USB\n");
++			return;
++		}
++	}
++	for (unsigned i = 0; i + 1 < size / 8 && nhc < MAX_HC; i += 2) {
++		struct hc *h = &hcs[nhc];
++		h->idx = nhc;
++		if (hc_init(h, reg[i], reg[i + 1]) == 0) {
++			nhc++;
++		}
++	}
++	if (nhc && kernel_thread_start(sweet_xhci_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
@@ -982,8 +1904,130 @@ index 2545cf9..f16af1b 100644
  	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
  	uint64_t mpidr = topology->cpus[logical].phys_id;
  	unsigned int aff0 = mpidr & 0xff;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..f5cf20d 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -559,3 +559,117 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * External USB keyboard and mouse (Pi 5: bsd/dev/sweet_xhci.c), presented
++ * the way IOHIDFamily's IOHIDEventDriver presents USB HID devices: a
++ * Generic Desktop Keyboard service sending keyboard-page key events, and a
++ * Generic Desktop Mouse service sending relative pointer and scroll events
++ * (iPadOS draws its own pointer for it).
++ */
++class SweetHIDKeyboard : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDKeyboard);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void key(UInt32 page, UInt32 usage, bool down);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Keyboard; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++	virtual OSString *getTransport() APPLE_KEXT_OVERRIDE { return OSString::withCString("USB"); }
++};
++OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++
++class SweetHIDPointer : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDPointer);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void report(int dx, int dy, UInt32 buttons, int wheel, int hwheel);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Mouse; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
++	virtual OSString *getTransport() APPLE_KEXT_OVERRIDE { return OSString::withCString("USB"); }
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 8000; }
++private:
++	UInt32 fButtons;
++};
++OSDefineMetaClassAndStructors(SweetHIDPointer, IOHIDEventService);
++
++static SweetHIDKeyboard *gSweetKeyboard;
++static SweetHIDPointer *gSweetPointer;
++
++bool
++SweetHIDKeyboard::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	/* An external keyboard: iPadOS hides the on-screen keyboard for it. */
++	setProperty(kIOHIDBuiltInKey, kOSBooleanFalse);
++	gSweetKeyboard = this;
++	registerService();
++	IOLog("SWEET HID: keyboard registered\n");
++	return true;
++}
++
++void
++SweetHIDKeyboard::key(UInt32 page, UInt32 usage, bool down)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), page, usage, down);
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++bool
++SweetHIDPointer::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOHIDBuiltInKey, kOSBooleanFalse);
++	gSweetPointer = this;
++	registerService();
++	IOLog("SWEET HID: pointer registered\n");
++	return true;
++}
++
++void
++SweetHIDPointer::report(int dx, int dy, UInt32 buttons, int wheel, int hwheel)
++{
++	uint64_t now = mach_absolute_time();
++	if (dx || dy || buttons != fButtons) {
++		IOHIDEvent *event = IOHIDEvent::relativePointerEvent(now, dx, dy, 0, buttons, fButtons);
++		if (event) {
++			dispatchEvent(event);
++			event->release();
++		}
++		fButtons = buttons;
++	}
++	if (wheel || hwheel) {
++		IOHIDEvent *event = IOHIDEvent::scrollEvent(now, hwheel, wheel, 0);
++		if (event) {
++			dispatchEvent(event);
++			event->release();
++		}
++	}
++}
++
++/* page/usage as in the USB HID report (keyboard page 7, consumer page 12). */
++extern "C" void
++sweet_hid_kbd(unsigned page, unsigned usage, int down)
++{
++	if (gSweetKeyboard) {
++		gSweetKeyboard->key(page, usage, down != 0);
++	}
++}
++
++extern "C" void
++sweet_hid_pointer(int dx, int dy, unsigned buttons, int wheel, int hwheel)
++{
++	if (gSweetPointer) {
++		gSweetPointer->report(dx, dy, buttons, wheel, hwheel);
++	}
++}
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index 92f3e26..dd26cb2 100644
+index 92f3e26..5f6a6f6 100644
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
 @@ -38,13 +38,13 @@ const char * gIOKernelConfigTables =
@@ -1002,6 +2046,23 @@ index 92f3e26..dd26cb2 100644
      "     'IOProbeScore'    = 10000:32;"
      "   },"
      "   {"
+@@ -78,6 +78,16 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDKeyboard;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDKeyboard;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDPointer;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDPointer;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 index e6c74aa..af3ae5c 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp

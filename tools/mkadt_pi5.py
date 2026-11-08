@@ -164,6 +164,17 @@ def build(qemu=False, seed=None):
             ('compatible', cstr('brcm,bcm2712-sdhci')),
             ('reg', u64(0x107cfff000, 0x260, 0x107cfff400, 0x200)),
         ]))
+        # bsd/dev/sweet_xhci.c: RP1's two DWC3 xHCI hosts (USB ports), at RP1
+        # BAR + 0x200000/0x300000 (CPU 0x1f00000000 with config.txt
+        # pciex4_reset=0). RP1 DMA sees CPU memory at +0x10_0000_0000.
+        # pcie-status: BCM2712 PCIe x4 RC PCIE_MISC_PCIE_STATUS (link check).
+        extra.append(node('sweet-xhci', [
+            ph(),
+            ('compatible', cstr('snps,dwc3')),
+            ('reg', u64(0x1f00200000, 0x100000, 0x1f00300000, 0x100000)),
+            ('dma-offset', u64(0x1000000000)),
+            ('pcie-status', u64(0x1000120000 + 0x4068)),
+        ]))
 
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
     # iPad (6th generation) has a Home button: home-button-type 0.
