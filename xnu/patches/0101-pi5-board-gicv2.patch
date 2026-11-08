@@ -849,10 +849,10 @@ index 0000000..2e545f3
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
 new file mode 100644
-index 0000000..e0d02c4
+index 0000000..9274c50
 --- /dev/null
 +++ b/bsd/dev/sweet_xhci.c
-@@ -0,0 +1,1426 @@
+@@ -0,0 +1,1683 @@
 +/*
 + * SWEET (Raspberry Pi 5) USB keyboard and mouse.
 + *
@@ -888,8 +888,23 @@ index 0000000..e0d02c4
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
++#include <kern/locks.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/if_media.h>
++#include <net/dlil.h>
++#include <sys/kern_event.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* iokit/Kernel/arm/SweetNet.cpp: IOKit objects configd looks for */
++extern void sweet_net_register(const char *prefix, unsigned unit, const unsigned char mac[6], const char *model);
++extern void sweet_net_link(int up);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
@@ -977,7 +992,8 @@ index 0000000..e0d02c4
 +#define D_CMD           0x1000
 +#define D_EVT           0x2000
 +#define D_SPARR         0x3000          /* scratchpad pointer array (<= 256) */
-+#define D_DEV(d)        (0x4000 + (d) * 0x3000)
++#define D_DEV(d)        (0x4000 + (d) * 0x4000)
++#define DEV_SIZE        0x4000
 +#define DV_IN           0x0000          /* input context (<= 33 x 64) */
 +#define DV_OUT          0x1000          /* device context (32 x 64) */
 +#define DV_EP0          0x1800
@@ -986,6 +1002,7 @@ index 0000000..e0d02c4
 +#define DV_REP(i)       (0x2400 + (i) * 0x40)
 +#define DV_RXB          0x2800          /* iPhone USB Ethernet receive buffer, 2 KiB */
 +#define ETH_RXB         0x800
++#define DV_TXB          0x3000          /* ... and transmit buffer, 2 KiB */
 +#define D_SP            (D_DEV(MAX_DEV))        /* scratchpad pages */
 +
 +struct ring {
@@ -1040,6 +1057,8 @@ index 0000000..e0d02c4
 +		struct ring in, out;
 +		uint8_t *rx;
 +		uint64_t rx_dma;
++		uint8_t *tx;
++		uint64_t tx_dma;
 +		uint32_t frames;
 +		uint8_t mac[6];
 +	} eth;
@@ -1161,6 +1180,8 @@ index 0000000..e0d02c4
 +
 +static void hid_report(struct hc *h, struct dev *d, struct hid_if *hi, uint32_t len);
 +static void eth_rx(struct hc *h, struct dev *d, uint32_t len);
++static void en_tx_done(void);
++static void en_detach_dev(struct dev *d);
 +
 +/*
 + * Minimal HID report descriptor parser: finds the input fields of a mouse
@@ -1318,6 +1339,11 @@ index 0000000..e0d02c4
 +				ring_put(h, &d->eth.in, (uint32_t)d->eth.rx_dma, (uint32_t)(d->eth.rx_dma >> 32),
 +				    ETH_RXB, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
 +				doorbell(h, d->slot, d->eth.in_dci);
++			} else if (d && d->eth.on && epid == d->eth.out_dci) {
++				if (cc != CC_SUCCESS && cc != CC_SHORT && xdebug) {
++					printf("SWEET USB: hc%d slot %u eth tx completion %u\n", h->idx, slot, cc);
++				}
++				en_tx_done();
 +			} else if (d) {
 +				for (int i = 0; i < MAX_HID; i++) {
 +					struct hid_if *hi = &d->hid[i];
@@ -1450,6 +1476,9 @@ index 0000000..e0d02c4
 +static void
 +dev_free(struct hc *h, struct dev *d)
 +{
++	if (d->eth.on) {
++		en_detach_dev(d);
++	}
 +	if (d->slot) {
 +		(void)command(h, 0, 0, TRB_TYPE(TRB_DISABLE_SLOT) | (uint32_t)d->slot << 24, NULL);
 +		((uint64_t *)(h->dma + D_DCBAA))[d->slot] = 0;
@@ -1469,6 +1498,207 @@ index 0000000..e0d02c4
 +		n++;
 +	}
 +	return MAX(n, 3u);
++}
++
++/*
++ * en1: the iPhone tethering link as an Ethernet ifnet, plus the IOKit objects
++ * configd needs (sweet_net_register) so it runs DHCP, routes and DNS on it.
++ * One iPhone at a time; the ifnet stays across unplug/replug (link off/on).
++ */
++#define EN_TXQ  32
++static LCK_GRP_DECLARE(sweet_en_grp, "sweet_en");
++static LCK_MTX_DECLARE(sweet_en_lock, &sweet_en_grp);
++static struct {
++	ifnet_t ifp;
++	struct hc *h;
++	struct dev *d;          /* the attached iPhone, or NULL */
++	bool tx_busy;
++	mbuf_t q[EN_TXQ];
++	uint32_t head, count;
++	uint64_t rx, tx, drops;
++} en;
++
++/* Next queued frame out through bulk OUT, if idle. Lock held. */
++static void
++en_tx_kick_locked(void)
++{
++	while (en.d && !en.tx_busy && en.count) {
++		mbuf_t m = en.q[en.head];
++		en.head = (en.head + 1) % EN_TXQ;
++		en.count--;
++		size_t len = mbuf_pkthdr_len(m);
++		if (len < ETHER_HDR_LEN || len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
++			mbuf_freem(m);
++			continue;
++		}
++		struct dev *d = en.d;
++		mbuf_copydata(m, 0, len, d->eth.tx);
++		mbuf_freem(m);
++		/* A multiple of the packet size would need a zero-length packet: pad one byte. */
++		if ((len % d->eth.out_mps) == 0) {
++			d->eth.tx[len++] = 0;
++		}
++		dsync(en.h, d->eth.tx, len);
++		ring_put(en.h, &d->eth.out, (uint32_t)d->eth.tx_dma, (uint32_t)(d->eth.tx_dma >> 32),
++		    (uint32_t)len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
++		doorbell(en.h, d->slot, d->eth.out_dci);
++		en.tx_busy = true;
++		en.tx++;
++	}
++}
++
++static errno_t
++en_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(&sweet_en_lock);
++	if (!en.d || en.count == EN_TXQ) {
++		en.drops++;
++		lck_mtx_unlock(&sweet_en_lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
++	en.q[(en.head + en.count) % EN_TXQ] = m;
++	en.count++;
++	en_tx_kick_locked();
++	lck_mtx_unlock(&sweet_en_lock);
++	return 0;
++}
++
++/* Bulk OUT completed (xHCI thread). */
++static void
++en_tx_done(void)
++{
++	lck_mtx_lock(&sweet_en_lock);
++	en.tx_busy = false;
++	en_tx_kick_locked();
++	lck_mtx_unlock(&sweet_en_lock);
++}
++
++static errno_t
++en_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ?
++		    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_AUTO;
++		bool up = en.d != NULL;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = up ? (IFM_ETHER | IFM_100_TX | IFM_FDX) : media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (up ? IFM_ACTIVE : 0);
++		ifmr->ifm_count = 1;
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			return copyout(&media, list, sizeof(media));
++		}
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++en_detach_cb(ifnet_t ifp __unused)
++{
++}
++
++static void
++en_link(bool up)
++{
++	if (en.ifp) {
++		dlil_post_msg(en.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	}
++	sweet_net_link(up);
++}
++
++/* The iPhone link is ready: create en1 once, then (re)attach it to this device. */
++static void
++en_attach(struct hc *h, struct dev *d)
++{
++	if (!en.ifp) {
++		struct ifnet_init_eparams init;
++		bzero(&init, sizeof(init));
++		init.ver = IFNET_INIT_CURRENT_VERSION;
++		init.len = sizeof(init);
++		init.flags = IFNET_INIT_LEGACY;
++		init.uniqueid = "sweet-ipheth";
++		init.uniqueid_len = sizeof("sweet-ipheth") - 1;
++		init.name = "en";
++		init.unit = 1;
++		init.family = IFNET_FAMILY_ETHERNET;
++		init.type = IFT_ETHER;
++		init.output = en_output;
++		init.demux = ether_demux;
++		init.add_proto = ether_add_proto;
++		init.del_proto = ether_del_proto;
++		init.check_multi = ether_check_multi;
++		init.framer_extended = ether_frameout_extended;
++		init.ioctl = en_ioctl;
++		init.detach = en_detach_cb;
++		init.broadcast_addr = etherbroadcastaddr;
++		init.broadcast_len = ETHER_ADDR_LEN;
++		if (ifnet_allocate_extended(&init, &en.ifp) != 0) {
++			printf("SWEET USB: en1 ifnet_allocate failed\n");
++			en.ifp = NULL;
++			return;
++		}
++		ifnet_set_addrlen(en.ifp, ETHER_ADDR_LEN);
++		ifnet_set_hdrlen(en.ifp, sizeof(struct ether_header));
++		ifnet_set_mtu(en.ifp, ETHERMTU);
++		ifnet_set_baudrate(en.ifp, 480000000);
++		ifnet_set_flags(en.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++		if (ifnet_attach(en.ifp, NULL) != 0) {
++			printf("SWEET USB: en1 ifnet_attach failed\n");
++			en.ifp = NULL;
++			return;
++		}
++		/* The host side's address is the one the phone hands out (as Linux ipheth). */
++		ifnet_set_lladdr(en.ifp, d->eth.mac, ETHER_ADDR_LEN);
++		sweet_net_register("en", 1, d->eth.mac, "iPhone USB Ethernet");
++	}
++	lck_mtx_lock(&sweet_en_lock);
++	en.h = h;
++	en.d = d;
++	en.tx_busy = false;
++	lck_mtx_unlock(&sweet_en_lock);
++	ifnet_set_flags(en.ifp, IFF_RUNNING, IFF_RUNNING);
++	en_link(true);
++	printf("SWEET USB: en1 up (iPhone tethering), waiting for configd/DHCP\n");
++}
++
++static void
++en_detach_dev(struct dev *d)
++{
++	lck_mtx_lock(&sweet_en_lock);
++	if (en.d != d) {
++		lck_mtx_unlock(&sweet_en_lock);
++		return;
++	}
++	en.d = NULL;
++	en.tx_busy = false;
++	while (en.count) {
++		mbuf_freem(en.q[en.head]);
++		en.head = (en.head + 1) % EN_TXQ;
++		en.count--;
++	}
++	lck_mtx_unlock(&sweet_en_lock);
++	ifnet_set_flags(en.ifp, 0, IFF_RUNNING);
++	en_link(false);
++	printf("SWEET USB: en1 link down (iPhone unplugged): rx %llu tx %llu drops %llu\n", en.rx, en.tx, en.drops);
 +}
 +
 +/*
@@ -1554,6 +1784,8 @@ index 0000000..e0d02c4
 +	d->eth.out_mps = mps_out;
 +	d->eth.rx = d->base + DV_RXB;
 +	d->eth.rx_dma = d->base_dma + DV_RXB;
++	d->eth.tx = d->base + DV_TXB;
++	d->eth.tx_dma = d->base_dma + DV_TXB;
 +	ring_init(h, &d->eth.in, d->base + DV_INT(0), INT_TRBS);
 +	ring_init(h, &d->eth.out, d->base + DV_INT(1), INT_TRBS);
 +
@@ -1600,6 +1832,7 @@ index 0000000..e0d02c4
 +	    cfgval, iface, alt, ep_in, mps_in, ep_out, mps_out,
 +	    d->eth.mac[0], d->eth.mac[1], d->eth.mac[2], d->eth.mac[3], d->eth.mac[4], d->eth.mac[5],
 +	    carrier, carrier == 4 ? "on: tethering active" : "off: needs Trust + Personal Hotspot");
++	en_attach(h, d);
 +}
 +
 +/* Received frame: 2 bytes of padding, then the Ethernet frame. Logged for now. */
@@ -1609,6 +1842,30 @@ index 0000000..e0d02c4
 +	uint8_t *f = d->eth.rx;
 +	dsync(h, f, ETH_RXB);
 +	d->eth.frames++;
++	/* Into the network stack (en1). One mbuf with a 2 KiB cluster holds any frame. */
++	uint32_t flen = len >= 2 ? len - 2 : 0;
++	if (en.ifp && en.d == d && flen >= ETHER_HDR_LEN && flen <= ETHER_MAX_LEN) {
++		mbuf_t m = NULL;
++		if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= flen) {
++			struct ifnet_stat_increment_param stats = {};
++			memcpy(mbuf_data(m), f + 2, flen);
++			mbuf_setlen(m, flen);
++			mbuf_pkthdr_setlen(m, flen);
++			void *frame_header = mbuf_data(m);
++			mbuf_pkthdr_setrcvif(m, en.ifp);
++			mbuf_pkthdr_setheader(m, frame_header);
++			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++			stats.packets_in = 1;
++			stats.bytes_in = flen;
++			en.rx++;
++			ifnet_input(en.ifp, m, &stats);
++		} else if (m != NULL) {
++			mbuf_freem(m);
++		}
++	}
 +	if (len >= 2 + 14 && (d->eth.frames <= 20 || xdebug > 1)) {
 +		const uint8_t *e = f + 2;
 +		printf("SWEET USB: iPhone frame %u: %u bytes, %02x:%02x:%02x:%02x:%02x:%02x <- "
@@ -1662,7 +1919,7 @@ index 0000000..e0d02c4
 +	d->speed = speed;
 +	d->base = h->dma + D_DEV(di);
 +	d->base_dma = dma_of(h, d->base);
-+	bzero(d->base, 0x3000);
++	bzero(d->base, DEV_SIZE);
 +
 +	uint32_t slot;
 +	if (command(h, 0, 0, TRB_TYPE(TRB_ENABLE_SLOT), &slot) || slot == 0 || slot > h->slots) {
@@ -2417,6 +2674,132 @@ index 2545cf9..f16af1b 100644
  	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
  	uint64_t mpidr = topology->cpus[logical].phys_id;
  	unsigned int aff0 = mpidr & 0xff;
+diff --git a/iokit/Kernel/arm/SweetNet.cpp b/iokit/Kernel/arm/SweetNet.cpp
+new file mode 100644
+index 0000000..723ca7c
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNet.cpp
+@@ -0,0 +1,120 @@
++/*
++ * SWEET: IOKit presence for kernel network interfaces (Pi 5 iPhone USB
++ * tethering, bsd/dev/sweet_xhci.c).
++ *
++ * configd (InterfaceNamer, PreferencesMonitor, IPMonitor) only manages
++ * interfaces it finds in the IOKit registry as IONetworkInterface objects
++ * under an IONetworkController. IONetworkingFamily is a separate kext on
++ * Apple's systems and is not built here; these minimal classes carry the
++ * same names and the properties configd reads, for an ifnet the driver
++ * created itself ("BSD Name" set, so nothing needs naming).
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++
++class IONetworkController : public IOService {
++	OSDeclareDefaultStructors(IONetworkController);
++};
++OSDefineMetaClassAndStructors(IONetworkController, IOService);
++
++class IOEthernetController : public IONetworkController {
++	OSDeclareDefaultStructors(IOEthernetController);
++};
++OSDefineMetaClassAndStructors(IOEthernetController, IONetworkController);
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class IOEthernetInterface : public IONetworkInterface {
++	OSDeclareDefaultStructors(IOEthernetInterface);
++};
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
++
++static IOEthernetController *gSweetNetController;
++static IOEthernetInterface *gSweetNetInterface;
++
++static void
++set_num(IOService *s, const char *key, unsigned long long v, unsigned bits)
++{
++	s->setProperty(key, v, bits);
++}
++
++/*
++ * Register an Ethernet controller + interface pair for the ifnet
++ * prefix<unit> ("en", 1 -> en1) with the given MAC. Once only.
++ */
++extern "C" void
++sweet_net_register(const char *prefix, unsigned unit, const unsigned char mac[6], const char *model)
++{
++	if (gSweetNetInterface) {
++		return;
++	}
++	IOService *res = IOService::getResourceService();
++	IOEthernetController *ctl = OSTypeAlloc(IOEthernetController);
++	IOEthernetInterface *nif = OSTypeAlloc(IOEthernetInterface);
++	if (!res || !ctl || !nif || !ctl->init() || !nif->init()) {
++		IOLog("SWEET NET: registry objects not created\n");
++		OSSafeReleaseNULL(ctl);
++		OSSafeReleaseNULL(nif);
++		return;
++	}
++
++	OSData *macd = OSData::withBytes(mac, 6);
++	ctl->setProperty("IOMACAddress", macd);
++	ctl->setProperty("IOVendor", "Apple");
++	ctl->setProperty("IOModel", model);
++	ctl->setProperty("IORevision", "1");
++	set_num(ctl, "IOLinkStatus", 3, 32);            /* valid | active */
++	set_num(ctl, "IOLinkSpeed", 480000000ULL, 64);
++	set_num(ctl, "IOMaxPacketSize", 1514, 32);
++	set_num(ctl, "IOMinPacketSize", 64, 32);
++	set_num(ctl, "IOFeatures", 0, 32);
++	OSSafeReleaseNULL(macd);
++
++	char bsd[16];
++	snprintf(bsd, sizeof(bsd), "%s%u", prefix, unit);
++	nif->setProperty("BSD Name", bsd);
++	nif->setProperty("IOInterfaceNamePrefix", prefix);
++	nif->setProperty("IOInterfaceName", prefix);
++	set_num(nif, "IOInterfaceUnit", unit, 32);
++	set_num(nif, "IOInterfaceType", 6, 32);         /* IFT_ETHER */
++	set_num(nif, "IOMediaAddressLength", 6, 32);
++	set_num(nif, "IOMediaHeaderLength", 14, 32);
++	set_num(nif, "IOMaxTransferUnit", 1500, 32);
++	set_num(nif, "IOInterfaceFlags", 0x8863, 32);
++	set_num(nif, "IOInterfaceState", 3, 32);
++	nif->setProperty("IOBuiltin", false);
++	nif->setProperty("IOPrimaryInterface", false);
++	nif->setProperty("IOLocation", "USB");
++
++	if (!ctl->attach(res)) {
++		IOLog("SWEET NET: controller attach failed\n");
++		ctl->release();
++		nif->release();
++		return;
++	}
++	ctl->registerService();
++	if (!nif->attach(ctl)) {
++		IOLog("SWEET NET: interface attach failed\n");
++		nif->release();
++		return;
++	}
++	nif->registerService();
++	gSweetNetController = ctl;
++	gSweetNetInterface = nif;
++	IOLog("SWEET NET: %s registered (IOEthernetInterface under IOEthernetController, %s)\n", bsd, model);
++}
++
++/* Link up/down as configd's KernelEventMonitor and SCNetworkInterface see it. */
++extern "C" void
++sweet_net_link(int up)
++{
++	if (gSweetNetController) {
++		gSweetNetController->setProperty("IOLinkStatus", up ? 3ULL : 1ULL, 32);
++	}
++}
 diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
 index 27bc49d..f5cf20d 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
@@ -2602,6 +2985,18 @@ index e6c74aa..af3ae5c 100644
  #endif
  
  //
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..063ae70 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetNet.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
 index 42362c5..895c357 100644
 --- a/osfmk/arm/arm_init.c
