@@ -849,10 +849,10 @@ index 0000000..2e545f3
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
 new file mode 100644
-index 0000000..eef0fa7
+index 0000000..9a2f51e
 --- /dev/null
 +++ b/bsd/dev/sweet_xhci.c
-@@ -0,0 +1,914 @@
+@@ -0,0 +1,1003 @@
 +/*
 + * SWEET (Raspberry Pi 5) USB keyboard and mouse.
 + *
@@ -1719,6 +1719,94 @@ index 0000000..eef0fa7
 +	}
 +}
 +
++/*
++ * BCM2712 PCIe x4 root complex (brcmstb) and RP1 behind it. If the firmware
++ * left RP1 unprogrammed (reads through the window then come back 0xdeaddead),
++ * do the minimum Linux's enumeration would: RP1 BARs at PCI 0x410000 (BAR0,
++ * 16K), 0x0 (BAR1, 4M peripherals), 0x400000 (BAR2, 64K SRAM), memory +
++ * bus-master on, the root port forwarding bus 1 and PCI 0..0x4fffff, and
++ * outbound window 0 mapping CPU 0x1f00000000 to PCI 0.
++ */
++#define RC_WIN0_LO              0x400c
++#define RC_WIN0_HI              0x4010
++#define RC_BAR2_LO              0x4034
++#define RC_BAR2_HI              0x4038
++#define RC_STATUS               0x4068
++#define RC_WIN0_BASE_LIMIT      0x4070
++#define RC_WIN0_BASE_HI         0x4080
++#define RC_WIN0_LIMIT_HI        0x4084
++#define RC_EXT_CFG_DATA         0x8000
++#define RC_EXT_CFG_INDEX        0x9000
++
++static vm_offset_t rc;
++
++static uint32_t
++rp1_cfg_rd(uint32_t off)
++{
++	wr32(rc, RC_EXT_CFG_INDEX, 1u << 20);   /* bus 1, device 0, function 0 */
++	return rd32(rc, RC_EXT_CFG_DATA + off);
++}
++
++static void
++rp1_cfg_wr(uint32_t off, uint32_t v)
++{
++	wr32(rc, RC_EXT_CFG_INDEX, 1u << 20);
++	wr32(rc, RC_EXT_CFG_DATA + off, v);
++}
++
++static void
++rp1_dump(const char *when)
++{
++	printf("SWEET USB: PCIe %s: RC id 0x%08x cmd 0x%08x bus 0x%08x memwin 0x%08x | win0 pci 0x%08x%08x"
++	    " base/limit 0x%08x hi 0x%x/0x%x | rc bar2 0x%08x%08x\n", when,
++	    rd32(rc, 0x00), rd32(rc, 0x04), rd32(rc, 0x18), rd32(rc, 0x20),
++	    rd32(rc, RC_WIN0_HI), rd32(rc, RC_WIN0_LO), rd32(rc, RC_WIN0_BASE_LIMIT),
++	    rd32(rc, RC_WIN0_BASE_HI), rd32(rc, RC_WIN0_LIMIT_HI),
++	    rd32(rc, RC_BAR2_HI), rd32(rc, RC_BAR2_LO));
++	printf("SWEET USB: RP1 %s: id 0x%08x cmd 0x%08x bar0 0x%08x bar1 0x%08x bar2 0x%08x\n", when,
++	    rp1_cfg_rd(0x00), rp1_cfg_rd(0x04), rp1_cfg_rd(0x10), rp1_cfg_rd(0x14), rp1_cfg_rd(0x18));
++}
++
++static void
++rp1_setup(uint64_t rc_pa, uint64_t probe_pa)
++{
++	rc = ml_io_map(rc_pa, 0xa000);
++	vm_offset_t probe = ml_io_map(probe_pa, PAGE_SIZE);
++	uint32_t v = rd32(probe, 0);
++	rp1_dump("as found");
++	if (v != 0xdeaddead && v != 0xffffffff) {
++		return;                 /* the firmware set it all up */
++	}
++	uint32_t id = rp1_cfg_rd(0x00);
++	if (id == 0xffffffff || id == 0xdeaddead || id == 0) {
++		printf("SWEET USB: RP1 does not answer config reads (0x%08x)\n", id);
++		return;
++	}
++	/* Root port: bus 0 -> 1, memory window PCI 0..0x4fffff, no prefetchable window. */
++	wr32(rc, 0x18, (rd32(rc, 0x18) & 0xff000000u) | 0x00010100u);
++	wr32(rc, 0x20, 0x00400000u);
++	wr32(rc, 0x24, 0x0000fff0u);
++	wr32(rc, 0x04, rd32(rc, 0x04) | 0x6);
++	/* RP1 BARs and decoding. */
++	rp1_cfg_wr(0x04, rp1_cfg_rd(0x04) & ~0x6u);
++	rp1_cfg_wr(0x10, 0x00410000u);
++	rp1_cfg_wr(0x14, 0x00000000u);
++	rp1_cfg_wr(0x18, 0x00400000u);
++	rp1_cfg_wr(0x04, rp1_cfg_rd(0x04) | 0x6);
++	/* Outbound window 0: CPU 0x1f00000000 + 4 GiB -> PCI 0. */
++	uint64_t cpu = 0x1f00000000ull, lim = cpu + 0xffffffffull;
++	uint32_t base_mb = (uint32_t)(cpu >> 20), limit_mb = (uint32_t)(lim >> 20);
++	wr32(rc, RC_WIN0_LO, 0);
++	wr32(rc, RC_WIN0_HI, 0);
++	wr32(rc, RC_WIN0_BASE_LIMIT, ((base_mb & 0xfff) << 4) | ((limit_mb & 0xfff) << 20));
++	wr32(rc, RC_WIN0_BASE_HI, base_mb >> 12);
++	wr32(rc, RC_WIN0_LIMIT_HI, limit_mb >> 12);
++	__builtin_arm_dsb(0xf);
++	IOSleep(5);
++	rp1_dump("after setup");
++	printf("SWEET USB: probe at 0x%llx now reads 0x%08x\n", probe_pa, rd32(probe, 0));
++}
++
 +void sweet_xhci_start(void);
 +
 +void
@@ -1754,6 +1842,7 @@ index 0000000..eef0fa7
 +			printf("SWEET USB: RP1 PCIe link is down (config.txt pciex4_reset=0?): no USB\n");
 +			return;
 +		}
++		rp1_setup(p[0] - RC_STATUS, reg[0]);
 +	}
 +	for (unsigned i = 0; i + 1 < size / 8 && nhc < MAX_HC; i += 2) {
 +		struct hc *h = &hcs[nhc];
