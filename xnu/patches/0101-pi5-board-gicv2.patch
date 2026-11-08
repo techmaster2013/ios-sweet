@@ -849,10 +849,10 @@ index 0000000..2e545f3
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
 new file mode 100644
-index 0000000..f4146bb
+index 0000000..eef0fa7
 --- /dev/null
 +++ b/bsd/dev/sweet_xhci.c
-@@ -0,0 +1,913 @@
+@@ -0,0 +1,914 @@
 +/*
 + * SWEET (Raspberry Pi 5) USB keyboard and mouse.
 + *
@@ -866,7 +866,7 @@ index 0000000..f4146bb
 + *     protocol and keeps one interrupt-IN transfer queued;
 + *   - turns reports into iPadOS HID events (iokit/Kernel/arm/hid/SweetHID.cpp):
 + *     keyboard usages to SweetHIDKeyboard, mouse motion/buttons/wheel to
-+ *     SweetHIDPointer. F1 is the Home button, F2 the side (lock) button.
++ *     SweetHIDPointer. Esc and F1 are the Home button, F2 the side (lock) button.
 + *
 + * DMA memory is one physically contiguous cacheable allocation; every
 + * structure is cleaned+invalidated (dsync) right after the CPU writes it and
@@ -1502,7 +1502,8 @@ index 0000000..f4146bb
 +kbd_special(uint8_t usage, int down)
 +{
 +	switch (usage) {
-+	case 0x3a:      /* F1: Home */
++	case 0x29:      /* Esc: Home (every keyboard has one) */
++	case 0x3a:      /* F1 (Back on Chromebook-style keyboards): Home */
 +		sweet_hid_key(3, down);
 +		return true;
 +	case 0x3b:      /* F2: side button (lock) */
