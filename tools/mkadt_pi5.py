@@ -184,6 +184,10 @@ def build(qemu=False, seed=None):
             ('reg', u64(0x1f00200000, 0x100000, 0x1f00300000, 0x100000)),
             ('dma-offset', u64(0x1000000000)),
             ('pcie-status', u64(0x1000120000 + 0x4068)),
+            # Power button: firmware DT /pwr_button = GPIO 20 of the brcmstb
+            # GPIO block at 0x107d508500 (bank 0 DATA at +4), active low.
+            ('power-button', u64(0x107d508500 + 4)),
+            ('power-button-bit', u32(20)),
         ]))
 
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])

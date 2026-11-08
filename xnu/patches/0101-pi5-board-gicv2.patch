@@ -849,10 +849,10 @@ index 0000000..2e545f3
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
 new file mode 100644
-index 0000000..01bc795
+index 0000000..2313bea
 --- /dev/null
 +++ b/bsd/dev/sweet_xhci.c
-@@ -0,0 +1,1027 @@
+@@ -0,0 +1,1251 @@
 +/*
 + * SWEET (Raspberry Pi 5) USB keyboard and mouse.
 + *
@@ -993,15 +993,34 @@ index 0000000..01bc795
 +	uint32_t pcs;
 +};
 +
++/*
++ * Mouse report layout from its HID report descriptor (report protocol), so
++ * the wheel works: boot protocol only guarantees buttons + X/Y (3 bytes).
++ * Offsets are in bits from the first byte after the report ID (if any).
++ */
++struct field {
++	uint16_t off;
++	uint8_t size;                   /* 0: absent */
++};
++
++struct mouse_layout {
++	bool valid, ids;                /* ids: reports start with a report ID byte */
++	uint8_t rid;                    /* the report ID carrying X/Y */
++	struct field btn, x, y, wheel, pan;
++	uint8_t nbtn;
++};
++
 +struct hid_if {
 +	bool used;
 +	uint8_t iface, proto;           /* 1 keyboard, 2 mouse */
 +	uint8_t ep, dci;
 +	uint16_t mps;
++	uint16_t rdesc_len;             /* from the HID class descriptor */
 +	struct ring ring;
 +	uint8_t *rep;
 +	uint64_t rep_dma;
 +	uint8_t last[8];
++	struct mouse_layout ml;
 +};
 +
 +struct dev {
@@ -1036,6 +1055,7 @@ index 0000000..01bc795
 +static int nhc;
 +static uint64_t dma_off;
 +static uint32_t xdebug;
++static int scroll_mult = 1;     /* boot-arg xhciscroll=N (negative inverts) */
 +
 +static inline uint32_t
 +rd32(vm_offset_t base, uint32_t off)
@@ -1127,6 +1147,123 @@ index 0000000..01bc795
 +}
 +
 +static void hid_report(struct hc *h, struct dev *d, struct hid_if *hi, uint32_t len);
++
++/*
++ * Minimal HID report descriptor parser: finds the input fields of a mouse
++ * (Generic Desktop X, Y, Wheel; Consumer AC Pan; Button page) in the report
++ * that carries X. Handles report IDs, usage lists and usage ranges.
++ */
++static void
++parse_mouse(const uint8_t *rd, uint32_t len, struct mouse_layout *ml)
++{
++	uint32_t page = 0, rsize = 0, rcount = 0, rid = 0;
++	uint32_t usages[16], nus = 0, umin = 0, umax = 0;
++	bool range = false;
++	uint16_t pos[16] = { 0 };       /* input bit position per report ID (low 4 bits) */
++	struct {
++		uint8_t rid;
++		struct field f;
++	} btn = { 0, { 0, 0 } }, x = btn, y = btn, wh = btn, pan = btn;
++	uint8_t nbtn = 0;
++
++	bzero(ml, sizeof(*ml));
++	for (uint32_t i = 0; i < len;) {
++		uint8_t b = rd[i];
++		if (b == 0xfe) {                /* long item */
++			if (i + 2 >= len) {
++				break;
++			}
++			i += 3 + rd[i + 1];
++			continue;
++		}
++		uint32_t sz = (b & 3) == 3 ? 4 : (b & 3), v = 0;
++		if (i + 1 + sz > len) {
++			break;
++		}
++		for (uint32_t k = 0; k < sz; k++) {
++			v |= (uint32_t)rd[i + 1 + k] << (8 * k);
++		}
++		i += 1 + sz;
++		switch (b & 0xfc) {
++		case 0x04: page = v; break;                     /* Usage Page */
++		case 0x74: rsize = v; break;                    /* Report Size */
++		case 0x94: rcount = v; break;                   /* Report Count */
++		case 0x84: rid = v; ml->ids = true; break;      /* Report ID */
++		case 0x08:                                      /* Usage */
++			if (nus < 16) {
++				usages[nus++] = sz == 4 ? v : (page << 16 | v);
++			}
++			break;
++		case 0x18: umin = sz == 4 ? v : (page << 16 | v); range = true; break;
++		case 0x28: umax = sz == 4 ? v : (page << 16 | v); range = true; break;
++		case 0x80: {                                    /* Input */
++			uint16_t *p = &pos[rid & 15];
++			if (!(v & 1) && (v & 2)) {              /* data, variable */
++				for (uint32_t f = 0; f < rcount && rsize && rsize <= 32; f++) {
++					uint32_t u = f < nus ? usages[f] :
++					    range ? MIN(umin + f, umax) : (nus ? usages[nus - 1] : 0);
++					struct field fl = { (uint16_t)(*p + f * rsize), (uint8_t)rsize };
++					if (u == 0x10030 && !x.f.size) {
++						x.rid = (uint8_t)rid; x.f = fl;
++					} else if (u == 0x10031 && !y.f.size) {
++						y.rid = (uint8_t)rid; y.f = fl;
++					} else if (u == 0x10038 && !wh.f.size) {
++						wh.rid = (uint8_t)rid; wh.f = fl;
++					} else if (u == 0xc0238 && !pan.f.size) {
++						pan.rid = (uint8_t)rid; pan.f = fl;
++					} else if (u == 0x90001 && !btn.f.size && rsize == 1) {
++						btn.rid = (uint8_t)rid; btn.f = fl;
++						nbtn = (uint8_t)MIN(rcount - f, 8u);
++					}
++				}
++			}
++			*p = (uint16_t)(*p + rsize * rcount);
++		}
++		/* FALLTHROUGH: main items clear the local usages */
++		case 0x90: case 0xb0: case 0xa0: case 0xc0:
++			nus = 0;
++			range = false;
++			break;
++		default:
++			break;
++		}
++	}
++	if (!x.f.size || !y.f.size || x.rid != y.rid) {
++		return;
++	}
++	ml->rid = x.rid;
++	ml->x = x.f;
++	ml->y = y.f;
++	if (btn.f.size && btn.rid == x.rid) {
++		ml->btn = btn.f;
++		ml->nbtn = nbtn;
++	}
++	if (wh.f.size && wh.rid == x.rid) {
++		ml->wheel = wh.f;
++	}
++	if (pan.f.size && pan.rid == x.rid) {
++		ml->pan = pan.f;
++	}
++	ml->valid = true;
++}
++
++/* Signed (or, for buttons, unsigned) bit field of a report. */
++static int32_t
++get_bits(const uint8_t *r, uint32_t rlen, struct field f, bool sign)
++{
++	uint32_t v = 0;
++	if (!f.size || f.off + f.size > rlen * 8) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < f.size; i++) {
++		uint32_t bit = f.off + i;
++		v |= (uint32_t)((r[bit / 8] >> (bit % 8)) & 1) << i;
++	}
++	if (sign && f.size < 32 && (v & (1u << (f.size - 1)))) {
++		v |= ~0u << f.size;
++	}
++	return (int32_t)v;
++}
 +
 +/* Drain the event ring. */
 +static void
@@ -1431,11 +1568,18 @@ index 0000000..01bc795
 +		const uint8_t *x = &cfg[off];
 +		if (x[1] == 4 && x[0] >= 9) {           /* interface */
 +			cur = -1;
-+			if (x[5] == 3 && x[6] == 1 && (x[7] == 1 || x[7] == 2) && nh < MAX_HID) {
++			/* HID keyboard/mouse, boot subclass or not (many 2.4 GHz dongles omit it). */
++			if (x[5] == 3 && (x[7] == 1 || x[7] == 2) && nh < MAX_HID) {
 +				cur = nh++;
 +				d->hid[cur].iface = x[2];
 +				d->hid[cur].proto = x[7];
 +			}
++			if (xdebug) {
++				printf("SWEET USB: interface %u class %u/%u/%u%s\n", x[2], x[5], x[6], x[7],
++				    cur >= 0 ? " (used)" : "");
++			}
++		} else if (x[1] == 0x21 && x[0] >= 9 && cur >= 0 && x[6] == 0x22) {
++			d->hid[cur].rdesc_len = (uint16_t)(x[7] | x[8] << 8);   /* HID: report descriptor size */
 +		} else if (x[1] == 5 && x[0] >= 7 && cur >= 0 && !d->hid[cur].used) {
 +			if ((x[2] & 0x80) && (x[3] & 3) == 3) {     /* interrupt IN */
 +				struct hid_if *hi = &d->hid[cur];
@@ -1485,9 +1629,26 @@ index 0000000..01bc795
 +		if (!hi->used) {
 +			continue;
 +		}
-+		(void)control(h, d, 0x21, 0x0b, 0, hi->iface, 0, NULL);        /* SET_PROTOCOL boot */
-+		if (hi->proto == 1) {
-+			(void)control(h, d, 0x21, 0x0a, 0, hi->iface, 0, NULL); /* SET_IDLE 0 */
++		if (hi->proto == 2) {
++			/* Mice: report protocol with the device's own layout (wheel included). */
++			uint16_t rl = (uint16_t)MIN(hi->rdesc_len ? hi->rdesc_len : 512u, 1024u);
++			uint32_t got = 0;
++			if (control(h, d, 0x81, 6, 0x2200, hi->iface, rl, &got) == 0) {
++				parse_mouse(d->base + DV_BUF, rl, &hi->ml);
++			}
++			if (hi->ml.valid) {
++				(void)control(h, d, 0x21, 0x0b, 1, hi->iface, 0, NULL); /* SET_PROTOCOL report */
++				printf("SWEET USB: mouse layout: id %u, buttons %u@%u, x %u@%u, y %u@%u, wheel %u@%u, pan %u@%u\n",
++				    hi->ml.ids ? hi->ml.rid : 0, hi->ml.nbtn, hi->ml.btn.off, hi->ml.x.size, hi->ml.x.off,
++				    hi->ml.y.size, hi->ml.y.off, hi->ml.wheel.size, hi->ml.wheel.off,
++				    hi->ml.pan.size, hi->ml.pan.off);
++			} else {
++				printf("SWEET USB: mouse report descriptor not understood: boot protocol (no wheel)\n");
++				(void)control(h, d, 0x21, 0x0b, 0, hi->iface, 0, NULL);
++			}
++		} else {
++			(void)control(h, d, 0x21, 0x0b, 0, hi->iface, 0, NULL);        /* SET_PROTOCOL boot */
++			(void)control(h, d, 0x21, 0x0a, 0, hi->iface, 0, NULL);        /* SET_IDLE 0 */
 +		}
 +		ring_put(h, &hi->ring, (uint32_t)hi->rep_dma, (uint32_t)(hi->rep_dma >> 32), hi->mps,
 +		    TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
@@ -1559,12 +1720,26 @@ index 0000000..01bc795
 +			}
 +		}
 +		memcpy(hi->last, r, 8);
++	} else if (hi->ml.valid) {
++		const uint8_t *p = hi->rep;
++		uint32_t n = MIN(len, (uint32_t)hi->mps);
++		if (hi->ml.ids) {
++			if (n < 1 || p[0] != hi->ml.rid) {
++				return;                 /* another report of this device */
++			}
++			p++;
++			n--;
++		}
++		uint32_t buttons = hi->ml.nbtn ? (uint32_t)get_bits(p, n,
++		    (struct field){ hi->ml.btn.off, hi->ml.nbtn }, false) & 7 : 0;
++		int dx = get_bits(p, n, hi->ml.x, true), dy = get_bits(p, n, hi->ml.y, true);
++		int wheel = get_bits(p, n, hi->ml.wheel, true), pan = get_bits(p, n, hi->ml.pan, true);
++		sweet_hid_pointer(dx, dy, buttons, wheel * scroll_mult, pan * scroll_mult);
 +	} else {
 +		if (len < 3) {
 +			return;
 +		}
-+		int wheel = len >= 4 ? (int8_t)r[3] : 0;
-+		sweet_hid_pointer((int8_t)r[1], (int8_t)r[2], r[0] & 7, wheel, 0);
++		sweet_hid_pointer((int8_t)r[1], (int8_t)r[2], r[0] & 7, 0, 0);
 +	}
 +}
 +
@@ -1698,6 +1873,36 @@ index 0000000..01bc795
 +	}
 +}
 +
++/*
++ * The Pi 5 power button (firmware DT /pwr_button: brcmstb GPIO 20 at
++ * 0x107d508500, active low; ADT /sweet-xhci power-button = the bank's DATA
++ * register, power-button-bit = 20) acts as the iPad side button. Holding it
++ * still powers the board off in hardware.
++ */
++static vm_offset_t pwr_reg;
++static uint32_t pwr_bit;
++
++static void
++poll_power_button(void)
++{
++	static bool state, cand;
++	static uint32_t stable;
++	if (!pwr_reg) {
++		return;
++	}
++	bool pressed = !(*(volatile uint32_t *)pwr_reg & (1u << pwr_bit));
++	if (pressed != cand) {
++		cand = pressed;
++		stable = 0;
++	} else if (cand != state && ++stable >= 10) {   /* ~40 ms debounce */
++		state = cand;
++		sweet_hid_key(0, state);
++		if (xdebug) {
++			printf("SWEET USB: power button %s\n", state ? "down" : "up");
++		}
++	}
++}
++
 +static void
 +sweet_xhci_thread(__unused void *arg, __unused wait_result_t wr)
 +{
@@ -1706,6 +1911,7 @@ index 0000000..01bc795
 +		scan(&hcs[i]);
 +	}
 +	for (uint32_t tick = 0;; tick++) {
++		poll_power_button();
 +		for (int i = 0; i < nhc; i++) {
 +			struct hc *h = &hcs[i];
 +			poll_events(h);
@@ -1827,6 +2033,8 @@ index 0000000..01bc795
 +
 +void sweet_xhci_start(void);
 +
++static void usb_setup(DTEntry node, uint64_t const *reg, unsigned int size);
++
 +void
 +sweet_xhci_start(void)
 +{
@@ -1838,13 +2046,32 @@ index 0000000..01bc795
 +
 +	PE_parse_boot_argn("xhci", &on, sizeof(on));
 +	PE_parse_boot_argn("xhcidebug", &xdebug, sizeof(xdebug));
-+	if (!on) {
-+		return;
-+	}
++	PE_parse_boot_argn("xhciscroll", &scroll_mult, sizeof(scroll_mult));
 +	if (SecureDTLookupEntry(NULL, "/sweet-xhci", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
 +		return;
 +	}
++	uint64_t const *pb = NULL;
++	uint32_t const *bit = NULL;
++	unsigned int pbsz = 0, bitsz = 0;
++	if (SecureDTGetProperty(node, "power-button", (void const **)&pb, &pbsz) == kSuccess && pbsz >= 8 &&
++	    SecureDTGetProperty(node, "power-button-bit", (void const **)&bit, &bitsz) == kSuccess && bitsz >= 4) {
++		pwr_reg = ml_io_map(pb[0] & ~(uint64_t)PAGE_MASK, PAGE_SIZE) + (pb[0] & PAGE_MASK);
++		pwr_bit = bit[0] & 31;
++		printf("SWEET USB: power button on GPIO bit %u (%s)\n", pwr_bit,
++		    (*(volatile uint32_t *)pwr_reg & (1u << pwr_bit)) ? "up" : "DOWN?");
++	}
++	if (on) {
++		usb_setup(node, reg, size);
++	}
++	if ((nhc || pwr_reg) && kernel_thread_start(sweet_xhci_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++static void
++usb_setup(DTEntry node, uint64_t const *reg, unsigned int size)
++{
 +	uint64_t const *p = NULL;
 +	unsigned int psz = 0;
 +	uint64_t rp1 = 0;
@@ -1874,9 +2101,6 @@ index 0000000..01bc795
 +		if (hc_init(h, pa, reg[i + 1]) == 0) {
 +			nhc++;
 +		}
-+	}
-+	if (nhc && kernel_thread_start(sweet_xhci_thread, NULL, &thread) == KERN_SUCCESS) {
-+		thread_deallocate(thread);
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
