@@ -1,5 +1,7 @@
 # ipados-rpi5
 
+[![xnu](https://github.com/techmaster2013/ipados-rpi5/actions/workflows/xnu.yml/badge.svg)](https://github.com/techmaster2013/ipados-rpi5/actions/workflows/xnu.yml)
+
 **Apple's iPadOS 16 running on a Raspberry Pi 5.**
 
 This project boots Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) on a Raspberry Pi 5, with the **unmodified iPadOS 16.6.1 (20G81) userland of the iPad (6th generation)** on top: launchd, the system daemons, backboardd, SpringBoard and the stock apps. It is built on [ios-sweet](https://github.com/dipa-studio/ios-sweet), which did the same for the Redmi Note 10 Pro; that project's README is kept in [docs/README-sweet.md](docs/README-sweet.md).
