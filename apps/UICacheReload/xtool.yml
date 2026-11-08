@@ -1,0 +1,4 @@
+version: 1
+bundleID: com.techmaster2013.UICacheReload
+infoPath: Info.plist
+entitlementsPath: Entitlements.plist
