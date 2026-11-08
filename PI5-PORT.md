@@ -328,6 +328,25 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   strategy with partition bounds checks, devfs nodes, root via rd=), with
   SDHCI PIO transfers first (DMA later).
 
+### Plans: USB tethering, Metal (2026-11-08)
+
+- **USB tethering to an iPhone** (network without a router cable): xHCI bulk
+  transfers; select the iPhone configuration with the Apple USB Ethernet
+  interface (class 0xff/0xfd/1, Linux `ipheth`); an ifnet driver for its
+  Ethernet frames; pairing over usbmux/lockdown (host certificates, Trust
+  prompt, TLS session) so the phone enables tethering; Personal Hotspot on.
+- **Metal** (user: Metal first, then GL). Image facts: the Metal driver is
+  userland `System/Library/Extensions/AGXMetalA10.bundle` (A10 only), loaded
+  for a kernel GPU service naming it; OpenGL ES is
+  `AppleMetalGLRenderer.bundle` on top of Metal (GL follows Metal);
+  CoreAnimation's shaders are `QuartzCore.framework/default.metallib` (AIR =
+  LLVM bitcode). Plan: kernel stub GPU service naming our own
+  `SweetMetal.bundle`; SweetMetal = software Metal (buffers, textures, render
+  passes, the subset CoreAnimation uses) with shaders compiled ahead of time
+  from AIR to arm64 on the PC and the `air.*` intrinsics implemented in C;
+  later V3D for the hot paths. backboardd today matches `AGXAccelerator`,
+  finds none and renders on the CPU.
+
 ### Stage 5 done, image v3 (2026-11-08)
 
 - USB keyboard + mouse work (bsd/dev/sweet_xhci.c). Firmware PCIe state with
