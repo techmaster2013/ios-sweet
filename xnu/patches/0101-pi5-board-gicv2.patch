@@ -844,6 +844,31 @@ index 0000000..687d005
 +	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 7a32a23..46a0bcc 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1366,6 +1366,20 @@ PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+ 	if (gIOPlatform) {
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: no RTC driver. boot-arg sweettime=<Unix seconds> (stamped by
++	 * tools/mkpayload.py when the payload is built) seeds the calendar
++	 * instead of 1970.
++	 */
++	if (*secs == 0) {
++		uint64_t t = 0;
++		if (PE_parse_boot_argn("sweettime", &t, sizeof(t)) && t) {
++			*secs = (clock_sec_t)t;
++			nsecs = 0;
++		}
++	}
++#endif
+ 
+ 	assert(nsecs < NSEC_PER_SEC);
+ 	*usecs = nsecs / NSEC_PER_USEC;
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 index 2545cf9..f16af1b 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
