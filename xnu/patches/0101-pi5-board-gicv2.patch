@@ -849,10 +849,10 @@ index 0000000..2e545f3
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
 new file mode 100644
-index 0000000..ee753ec
+index 0000000..01bc795
 --- /dev/null
 +++ b/bsd/dev/sweet_xhci.c
-@@ -0,0 +1,1033 @@
+@@ -0,0 +1,1027 @@
 +/*
 + * SWEET (Raspberry Pi 5) USB keyboard and mouse.
 + *
@@ -1764,15 +1764,13 @@ index 0000000..ee753ec
 +rp1_dump(const char *when)
 +{
 +	printf("SWEET USB: PCIe %s: RC id 0x%08x cmd 0x%08x bus 0x%08x memwin 0x%08x | win0 pci 0x%08x%08x"
-+	    " base/limit 0x%08x hi 0x%x/0x%x | rc bar2 0x%08x%08x remap 0x%08x%08x
-+", when,
++	    " base/limit 0x%08x hi 0x%x/0x%x | rc bar2 0x%08x%08x remap 0x%08x%08x\n", when,
 +	    rd32(rc, 0x00), rd32(rc, 0x04), rd32(rc, 0x18), rd32(rc, 0x20),
 +	    rd32(rc, RC_WIN0_HI), rd32(rc, RC_WIN0_LO), rd32(rc, RC_WIN0_BASE_LIMIT),
 +	    rd32(rc, RC_WIN0_BASE_HI), rd32(rc, RC_WIN0_LIMIT_HI),
 +	    rd32(rc, RC_BAR2_HI), rd32(rc, RC_BAR2_LO),
 +	    rd32(rc, RC_UBUS_REMAP_HI), rd32(rc, RC_UBUS_REMAP_LO));
-+	printf("SWEET USB: RP1 %s: id 0x%08x cmd 0x%08x bar0 0x%08x bar1 0x%08x bar2 0x%08x
-+", when,
++	printf("SWEET USB: RP1 %s: id 0x%08x cmd 0x%08x bar0 0x%08x bar1 0x%08x bar2 0x%08x\n", when,
 +	    rp1_cfg_rd(0x00), rp1_cfg_rd(0x04), rp1_cfg_rd(0x10), rp1_cfg_rd(0x14), rp1_cfg_rd(0x18));
 +}
 +
@@ -1787,8 +1785,7 @@ index 0000000..ee753ec
 +	}
 +	uint32_t id = rp1_cfg_rd(0x00);
 +	if (id == 0xffffffff || id == 0xdeaddead || id == 0) {
-+		printf("SWEET USB: RP1 does not answer config reads (0x%08x)
-+", id);
++		printf("SWEET USB: RP1 does not answer config reads (0x%08x)\n", id);
 +		return 0;
 +	}
 +	/* Outbound window 0 as programmed. */
@@ -1797,8 +1794,7 @@ index 0000000..ee753ec
 +	uint64_t cpu_mb = (uint64_t)rd32(rc, RC_WIN0_BASE_HI) << 12 | ((bl >> 4) & 0xfff);
 +	uint64_t lim_mb = (uint64_t)rd32(rc, RC_WIN0_LIMIT_HI) << 12 | (bl >> 20);
 +	if (bl == 0 || lim_mb < cpu_mb) {
-+		printf("SWEET USB: no outbound PCIe window
-+");
++		printf("SWEET USB: no outbound PCIe window\n");
 +		return 0;
 +	}
 +	uint64_t cpu = cpu_mb << 20, len = (lim_mb - cpu_mb + 1) << 20;
@@ -1811,8 +1807,7 @@ index 0000000..ee753ec
 +		rp1_cfg_wr(0x18, (uint32_t)pci + 0x400000u);
 +		rp1_cfg_wr(0x10, (uint32_t)pci + 0x410000u);
 +		bar1 = pci;
-+		printf("SWEET USB: RP1 BARs assigned at PCI 0x%llx
-+", pci);
++		printf("SWEET USB: RP1 BARs assigned at PCI 0x%llx\n", pci);
 +	}
 +	rp1_cfg_wr(0x04, rp1_cfg_rd(0x04) | 0x6);       /* memory decode + bus master */
 +	wr32(rc, 0x04, rd32(rc, 0x04) | 0x6);
@@ -1826,8 +1821,7 @@ index 0000000..ee753ec
 +	rp1_dump("after setup");
 +	uint64_t base = cpu + (bar1 - pci);
 +	vm_offset_t probe = ml_io_map(base + 0x200000, PAGE_SIZE);
-+	printf("SWEET USB: RP1 at CPU 0x%llx (PCI 0x%llx); xHCI 0 reads 0x%08x
-+", base, bar1, rd32(probe, 0));
++	printf("SWEET USB: RP1 at CPU 0x%llx (PCI 0x%llx); xHCI 0 reads 0x%08x\n", base, bar1, rd32(probe, 0));
 +	return base;
 +}
 +
