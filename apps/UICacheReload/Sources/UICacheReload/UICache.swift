@@ -13,6 +13,12 @@ enum UICache {
     }
 
     static let appDirectories = ["/Applications", "/var/jb/Applications"]
+    static let useContainers = false
+
+    /// Unbuffered line to stdout (the console log when run by launchd).
+    static func log(_ s: String) {
+        FileHandle.standardOutput.write(Data("uicache reload: \(s)\n".utf8))
+    }
 
     // Set once, then only read (LSApplicationWorkspace is thread-safe).
     nonisolated(unsafe) private static let workspace: NSObject? = {
@@ -52,7 +58,10 @@ enum UICache {
 
     static func register(bundle path: String) -> Result? {
         guard let info = NSDictionary(contentsOfFile: "\(path)/Info.plist") as? [String: Any],
-              let bundleID = info["CFBundleIdentifier"] as? String else { return nil }
+              let bundleID = info["CFBundleIdentifier"] as? String else {
+            log("cannot read \(path)/Info.plist")
+            return nil
+        }
         let name = (info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String) ?? bundleID
         if bundleID.hasPrefix("com.apple.") {
             return nil
@@ -71,7 +80,9 @@ enum UICache {
         dict["MissingSINF"] = false
         dict["FamilyID"] = 0
         dict["IsOnDemandInstallCapable"] = false
-        if let home = dataContainer(for: bundleID) {
+        // Built-in apps in /Applications run without a data container (HOME is
+        // /var/mobile); creating one needs containermanagerd, which may not be up yet.
+        if useContainers, let home = dataContainer(for: bundleID) {
             dict["Container"] = home
             dict["EnvironmentVariables"] = [
                 "CFFIXED_USER_HOME": home,
@@ -93,12 +104,24 @@ enum UICache {
         appBundles().compactMap { register(bundle: $0) }
     }
 
-    /// launchd boot job: register everything, log to stdout (the console), exit.
+    /// launchd boot job: wait for the system (lsd, SpringBoard) to be up, register
+    /// everything, retry a few times, log each step unbuffered, exit.
     static func runBoot() {
-        let results = reloadAll()
-        print("uicache reload: \(workspace == nil ? "NO LSApplicationWorkspace" : "LSApplicationWorkspace ok"), \(results.count) app(s)")
-        for r in results {
-            print("uicache reload: \(r.ok ? "registered" : "FAILED") \(r.name) (\(r.bundleID))")
+        log("boot job started, waiting 60 s for the system to come up")
+        Thread.sleep(forTimeInterval: 60)
+        log("apps found: \(appBundles().joined(separator: ", "))")
+        for attempt in 1...5 {
+            log("attempt \(attempt): LSApplicationWorkspace \(workspace == nil ? "MISSING" : "ok")")
+            let results = reloadAll()
+            for r in results {
+                log("\(r.ok ? "registered" : "FAILED") \(r.name) (\(r.bundleID))")
+            }
+            if !results.isEmpty && results.allSatisfy(\.ok) {
+                log("done")
+                return
+            }
+            Thread.sleep(forTimeInterval: 20)
         }
+        log("gave up after 5 attempts")
     }
 }

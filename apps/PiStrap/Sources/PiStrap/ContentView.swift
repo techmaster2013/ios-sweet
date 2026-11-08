@@ -56,6 +56,7 @@ final class Strapper: ObservableObject {
 struct ContentView: View {
     @StateObject private var strapper = Strapper()
     @State private var showOptions = false
+    @State private var showManagers = false
 
     var body: some View {
         ZStack {
@@ -84,7 +85,7 @@ struct ContentView: View {
                     .frame(maxWidth: 520)
 
                 Button {
-                    strapper.run()
+                    showManagers = true
                 } label: {
                     HStack(spacing: 10) {
                         if strapper.state == .running {
@@ -120,6 +121,12 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showOptions) {
             OptionsView(options: $strapper.options)
+        }
+        .sheet(isPresented: $showManagers) {
+            ManagersView(options: $strapper.options) {
+                showManagers = false
+                strapper.run()
+            }
         }
     }
 
@@ -159,8 +166,10 @@ struct ContentView: View {
     }
 }
 
-struct OptionsView: View {
+/// Shown when Jailbreak is pressed: pick what to install, then go.
+struct ManagersView: View {
     @Binding var options: StrapOptions
+    let start: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -172,20 +181,49 @@ struct OptionsView: View {
                     Toggle("TrollStore Lite", isOn: $options.trollStoreLite)
                 } header: {
                     Text("Package managers")
+                } footer: {
+                    Text("Sileo is the recommended package manager for iPadOS 16. TrollStore Lite installs IPA files.")
                 }
+                Section {
+                    Toggle("Cydia (classic)", isOn: $options.cydia)
+                } footer: {
+                    Text("Cydia needs the old rootful layout in /. Most modern tweaks expect rootless, so leave this off unless you want Cydia.")
+                }
+                Section {
+                    Button {
+                        start()
+                    } label: {
+                        Text("Jailbreak")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .disabled(!(options.sileo || options.zebra || options.trollStoreLite || options.cydia))
+                }
+            }
+            .navigationTitle("Choose package managers")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+struct OptionsView: View {
+    @Binding var options: StrapOptions
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
                 Section {
                     Toggle("ElleKit", isOn: $options.ellekit)
                 } header: {
                     Text("Tweaks")
                 } footer: {
                     Text("Tweak injection for rootless packages.")
-                }
-                Section {
-                    Toggle("Cydia (classic)", isOn: $options.cydia)
-                } header: {
-                    Text("Classic")
-                } footer: {
-                    Text("Cydia needs the old rootful layout in /. Most modern tweaks expect rootless, so leave this off unless you want Cydia.")
                 }
             }
             .navigationTitle("Options")
