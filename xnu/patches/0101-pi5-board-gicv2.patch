@@ -12,10 +12,10 @@ index 6630131..7e73d5f 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
 new file mode 100644
-index 0000000..5ffe735
+index 0000000..687d005
 --- /dev/null
 +++ b/bsd/dev/sweet_sd.c
-@@ -0,0 +1,699 @@
+@@ -0,0 +1,828 @@
 +/*
 + * SWEET (Raspberry Pi 5) SD card root device.
 + *
@@ -48,12 +48,20 @@ index 0000000..5ffe735
 +#include <miscfs/devfs/devfs.h>
 +#include <kern/locks.h>
 +#include <kern/clock.h>
++#include <kern/sched_prim.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
 +
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++/* Console ring (bsd/dev/sweet_ufs.c, fed by _cnputs). */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++static void sweet_sd_log_start(void);
 +
 +/* SDHCI registers, all accessed as aligned 32-bit words. */
 +#define SD_BLK          0x04    /* [11:0] block size, [31:16] block count */
@@ -121,6 +129,7 @@ index 0000000..5ffe735
 +	bool ccs;                               /* block (not byte) addressed */
 +	uint64_t card_blocks;                   /* from the CSD, 0 if unknown */
 +	uint64_t first_block, nblocks;          /* partition, in 512-byte blocks */
++	uint64_t log_first, log_nblocks;        /* console log partition (MBR type 0xDA) */
 +	uint32_t secsize;                       /* logical sector size for the BSD layer */
 +	bool writable;                          /* boot-arg sdrw=1 */
 +	int bmajor, cmajor;
@@ -462,6 +471,11 @@ index 0000000..5ffe735
 +			sd.first_block = start;
 +			sd.nblocks = count;
 +		}
++		if (e[4] == 0xda && !sd.log_nblocks && count &&
++		    (!sd.card_blocks || (uint64_t)start + count <= sd.card_blocks)) {
++			sd.log_first = start;
++			sd.log_nblocks = count;
++		}
 +	}
 +	if (pick < 0) {
 +		printf("SWEET SD: no %s partition\n", want ? "sdpart=" : "type 0xAF (HFS+)");
@@ -696,7 +710,122 @@ index 0000000..5ffe735
 +	sd.ready = true;
 +	printf("SWEET SD: root partition at block %llu, %llu MiB, %s\n",
 +	    sd.first_block, sd.nblocks >> 11, sd.writable ? "read-write" : "read-only");
++	sweet_sd_log_start();
 +	return 0;
++}
++
++/*
++ * Persistent console log on the SD card. The console ring kept by
++ * sweet_ufs.c (every _cnputs byte: kernel printf and daemons' /dev/console)
++ * is copied every sdlogsecs seconds (default 2) to the MBR partition of type
++ * 0xDA, in the phone's format (tools/sweet-log.py): bytes [0, 4096) a header
++ *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes | u64 flush seq
++ * then the 4 MiB ring, console byte n at ring offset n % size. Only that
++ * partition is ever written here (sd_log_write). Disabled with sdlog=0.
++ */
++#define SDLOG_RING      (4u << 20)
++#define SDLOG_HDR       (4096u / SD_BLOCK)
++#define SDLOG_BLOCKS    (SDLOG_HDR + SDLOG_RING / SD_BLOCK)
++#define SDLOG_CHUNK     (64u << 10)
++
++static uint8_t sdlog_buf[SDLOG_CHUNK];
++static int sdlog_chan;
++static uint32_t sdlog_secs = 2;
++
++static int
++sd_log_write(uint64_t rel, uint32_t n, uint8_t *buf)
++{
++	if (!sd.log_nblocks || n == 0 || rel >= SDLOG_BLOCKS || n > SDLOG_BLOCKS - rel ||
++	    SDLOG_BLOCKS > sd.log_nblocks) {
++		printf("SWEET SD: refusing log write of %u blocks at +%llu\n", n, rel);
++		return EPERM;
++	}
++	return sd_xfer(sd.log_first + rel, n, buf, true);
++}
++
++static void
++sweet_sd_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t flushed = 0, seq = 0;
++
++	printf("SWEET SD LOG: console log to partition at block %llu every %u s\n",
++	    sd.log_first, sdlog_secs);
++	for (;;) {
++		(void)tsleep(&sdlog_chan, PZERO, "sdlog", hz * (int)sdlog_secs);
++		uint64_t total = sweet_log_position();
++		if (total == flushed) {
++			continue;
++		}
++		/* Rewrite from the start of the sector holding the first new byte. */
++		uint64_t pos = flushed & ~(uint64_t)(SD_BLOCK - 1);
++		if (total - pos > SDLOG_RING) {
++			pos = (total - SDLOG_RING + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
++		}
++		int error = 0;
++		lck_mtx_lock(&sweet_sd_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % SDLOG_RING);
++			uint32_t want = (uint32_t)MIN(MIN(total - pos, (uint64_t)SDLOG_CHUNK),
++			    (uint64_t)(SDLOG_RING - off));
++			uint64_t p = pos;
++			uint32_t got = sweet_log_copy(&p, (char *)sdlog_buf, want);
++			if (p - got != pos) {
++				/* Fell a whole ring behind: restart at a sector boundary. */
++				pos = (p - got + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
++				continue;
++			}
++			if (got == 0) {
++				break;
++			}
++			uint32_t blocks = (got + SD_BLOCK - 1) / SD_BLOCK;
++			bzero(sdlog_buf + got, blocks * SD_BLOCK - got);
++			error = sd_log_write(SDLOG_HDR + off / SD_BLOCK, blocks, sdlog_buf);
++			pos += got;
++		}
++		if (!error) {
++			struct {
++				char magic[8];
++				uint32_t version, size;
++				uint64_t total, seq;
++			} h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = SDLOG_RING, .total = total, .seq = ++seq,
++			};
++			bzero(sdlog_buf, SD_BLOCK);
++			memcpy(sdlog_buf, &h, sizeof(h));
++			error = sd_log_write(0, 1, sdlog_buf);
++		}
++		lck_mtx_unlock(&sweet_sd_lock);
++		if (error) {
++			printf("SWEET SD LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++sweet_sd_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sdlog", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (sd.log_nblocks < SDLOG_BLOCKS) {
++		printf("SWEET SD LOG: no log partition (MBR type 0xDA, >= %u KiB)\n",
++		    SDLOG_BLOCKS / 2);
++		return;
++	}
++	PE_parse_boot_argn("sdlogsecs", &sdlog_secs, sizeof(sdlog_secs));
++	if (sdlog_secs == 0 || sdlog_secs > 60) {
++		sdlog_secs = 2;
++	}
++	if (kernel_thread_start(sweet_sd_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
 +}
 +
 +/* Root device for rd=sdroot0 (IOFindBSDRoot). */
