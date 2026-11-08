@@ -13,10 +13,10 @@ index 6630131..468b01d 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
 new file mode 100644
-index 0000000..2e545f3
+index 0000000..4812b1f
 --- /dev/null
 +++ b/bsd/dev/sweet_sd.c
-@@ -0,0 +1,830 @@
+@@ -0,0 +1,876 @@
 +/*
 + * SWEET (Raspberry Pi 5) SD card root device.
 + *
@@ -214,6 +214,8 @@ index 0000000..2e545f3
 + * Issue one command. For data commands the caller then moves the blocks
 + * through SD_DATA. resp (4 words, may be NULL) receives the response.
 + */
++static uint32_t sd_blksz = SD_BLOCK;    /* data block size of the next command */
++
 +static int
 +sd_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t mode, uint32_t blocks,
 +    uint32_t resp[4])
@@ -226,7 +228,7 @@ index 0000000..2e545f3
 +	}
 +	sd_wr(SD_INT, 0xffffffff);
 +	if (flags & F_DATA) {
-+		sd_wr(SD_BLK, SD_BLOCK | (blocks << 16));
++		sd_wr(SD_BLK, sd_blksz | (blocks << 16));
 +	}
 +	sd_wr(SD_ARG, arg);
 +	sd_wr(SD_XFER, mode | ((idx << 8 | flags) << 16));
@@ -327,6 +329,42 @@ index 0000000..2e545f3
 +		return EPERM;
 +	}
 +	return sd_xfer(lba, n, buf, true);
++}
++
++/*
++ * High Speed (50 MHz, 3.3 V): CMD6 SWITCH_FUNC mode 1, group 1 function 1,
++ * read the 64-byte status; the card switched if the group 1 result (status
++ * bits 379:376 = low nibble of byte 16) reads 1.
++ */
++static int
++sd_switch_hs(void)
++{
++	uint8_t st[64];
++	int error;
++
++	sd_blksz = 64;
++	error = sd_cmd(6, 0x80fffff1, R_R1 | F_DATA, TM_READ, 1, NULL);
++	if (!error) {
++		error = sd_wait_int(INT_BUF_RD, "data", 6);
++	}
++	if (!error) {
++		for (uint32_t i = 0; i < sizeof(st); i += 4) {
++			uint32_t w = sd_rd(SD_DATA);
++			memcpy(st + i, &w, 4);
++		}
++		error = sd_wait_int(INT_XFER_DONE, "transfer", 6);
++	}
++	sd_blksz = SD_BLOCK;
++	if (error) {
++		return error;
++	}
++	if ((st[16] & 0xf) != 1) {
++		printf("SWEET SD: card did not switch to high speed (group 1 result 0x%x, support 0x%02x%02x)\n",
++		    st[16] & 0xf, st[12], st[13]);
++		return ENOTSUP;
++	}
++	delay(1000);
++	return 0;
 +}
 +
 +static int
@@ -441,9 +479,17 @@ index 0000000..2e545f3
 +	if ((error = sd_cmd(16, SD_BLOCK, R_R1, 0, 0, NULL))) {
 +		return error;
 +	}
-+	uint32_t hz = 25000000;
++	uint32_t hz = 25000000, max = 25000000, hs = 1;
++	PE_parse_boot_argn("sdhs", &hs, sizeof(hs));
++	if (hs && sd_switch_hs() == 0) {
++		sd_wr(SD_HOSTCTL, sd_rd(SD_HOSTCTL) | (1u << 2));       /* host high speed enable */
++		hz = max = 50000000;
++		printf("SWEET SD: high speed mode (50 MHz)\n");
++	} else if (hs) {
++		printf("SWEET SD: staying at default speed (25 MHz)\n");
++	}
 +	PE_parse_boot_argn("sdclk", &hz, sizeof(hz));
-+	return sd_set_clock(MIN(hz, 25000000u));
++	return sd_set_clock(MIN(hz, max));
 +}
 +
 +static int

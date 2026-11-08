@@ -15,9 +15,12 @@ enum UICache {
     static let appDirectories = ["/Applications", "/var/jb/Applications"]
     static let useContainers = false
 
-    /// Unbuffered line to stdout (the console log when run by launchd).
+    /// Unbuffered line to stdout (the console log when run by launchd). Plain
+    /// write(2): FileHandle.write raises an Objective-C exception on a failed
+    /// write, which killed the first boot job (v6).
     static func log(_ s: String) {
-        FileHandle.standardOutput.write(Data("uicache reload: \(s)\n".utf8))
+        let bytes = Array("uicache reload: \(s)\n".utf8)
+        _ = bytes.withUnsafeBufferPointer { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
     }
 
     // Set once, then only read (LSApplicationWorkspace is thread-safe).
