@@ -328,6 +328,27 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   strategy with partition bounds checks, devfs nodes, root via rd=), with
   SDHCI PIO transfers first (DMA later).
 
+### LOCK SCREEN on the Pi (2026-11-07, ~22:30 local)
+
+- Card: partition 3 = v2 image minus bluetoothd and fairplayd.A2 jobs
+  (SHA256 b4dc709b...59c5, written + verified by sd-write-root.ps1), payload
+  = out-pi5/payload-sdrw.bin (kernel 44026ab, cmdline above).
+- Boot: `exec mount_hfs` sat ~10+ min (root remount; cause unknown, probably
+  slow PIO reads), then mmaintenanced, `SWEET AKS: linkd/triald sel 17 -> 0`,
+  many SpringBoard lines, logo fade, **iPadOS lock screen on HDMI**:
+  landscape, correct proportions (only the boot logo was squashed), "Press
+  home to open", battery 100% charging, date Wed Dec 31 (epoch 0, no RTC).
+  Console text drawn over it (`SWEET FB: backboardd sel 72 ...`).
+- Pending (not yet on the card):
+  - kernel a009ff0 (CI 42441823788, built): SD console log to MBR
+    partition 4 type 0xDA (64 MiB at byte 20258488320; created by
+    scratchpad sd-log.ps1, which also reads it back -> tools/sweet-log.py).
+  - kernel 5c503df (CI running): + boot-arg sweettime=<unix secs> seeds the
+    calendar in PEGetUTCTimeOfDay.
+  - next cmdline = previous + `sweetfb_noconsole=1 sweettime=$(date +%s)`.
+- Next: card in PC -> sd-log.ps1 (UAC) creates partition 4 -> new payload;
+  then stage 5 (USB HID) to unlock; SD speed (HS/DMA); network; Sileo.
+
 ### First userland boot on the Pi (2026-11-07, evening)
 
 - Kernel 44026ab (CI 42421982536) + ADT with /sweet-sd. Read-only boot
