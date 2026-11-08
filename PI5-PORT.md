@@ -328,6 +328,27 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   strategy with partition bounds checks, devfs nodes, root via rd=), with
   SDHCI PIO transfers first (DMA later).
 
+### Stage 5 done, image v3 (2026-11-08)
+
+- USB keyboard + mouse work (bsd/dev/sweet_xhci.c). Firmware PCIe state with
+  pciex4_reset=0: window 0 CPU 0x1c00000000 -> PCI 0x80000000, root port bus
+  numbers 0 (set to 0/1/1), inbound BAR2 PCI 0 (moved to 0x10_0000_0000);
+  RP1 BARs 0x80410000/0x80000000/0x80400000. Mouse wheel needs report
+  protocol (boot reports are 3 bytes). Power button = GPIO 20 @0x107d508500.
+- Shim patches the ADT per board: serial-number (firmware /serial-number),
+  dram-size + /pram (2 GB boards), /sweet-fbcon + disp0 canvas. About shows
+  "Raspberry Pi 5" / "RPI5" / the serial.
+- Crash analysis with tools/dsc_sym.py (shared cache symbolizer; cache copied
+  to WSL ~/pi5-build/dsc). Settings > iPad Storage: PodcastsUI force-unwraps
+  [MPMediaLibrary defaultMediaLibrary].databasePath (nil: no
+  /var/mobile/Media/iTunes_Control). Photos: assetsd uncaught ObjC exception
+  (reason not yet logged).
+- The card's root after a power cut has a non-empty journal (start 1799168 end
+  3372544): Linux cannot edit it (no replay, fsck_hfs ignores the journal).
+  So v3 = v2 + iTunes_Control/iTunes (501) + assetsd stdout/stderr to console
+  + time zone America/New_York (localtime + zoneinfo links + datetime pref),
+  SHA256 14af46d3...2b91d, written + verified 2026-11-08 11:31.
+
 ### LOCK SCREEN on the Pi (2026-11-07, ~22:30 local)
 
 - Card: partition 3 = v2 image minus bluetoothd and fairplayd.A2 jobs
