@@ -491,3 +491,17 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
     minor repair (1, 0)" / "invalid primary VHB ... result 35" (VIStat
     0x8000 only, all B-tree/catalog checks clean) while `-y` says OK: a
     read-only-mode quirk of the Linux fsck port, header flags are fine.
+
+### 2026-11-09: hidden apps + slow first logo found
+
+- Apps: LaunchServices and SpringBoard knew them all along (App Library
+  category cache lists PiInfo/PiStrap/UICacheReload, MCM data containers
+  exist). SpringBoard never placed them: home page 1 is full of widgets, so
+  they went to the App Library only. v10 = card + IconState.plist page 2 with
+  the three apps (5-block delta, written + verified 15:16).
+- Slow first Apple logo: 30 s gap in the kernel log (2.0 s -> 31.8 s) =
+  IOKitInitializeTime waiting for an IORTC that never comes. Patch 0101 now
+  skips it on ARM64_BOARD_CONFIG_SWEET (commit 7acde54, CI 42689603214).
+  Rest of boot: launchd 32.7 s, SpringBoard 39.8 s.
+- Shutdown: launchd teardown + unmount ran cleanly; the log ends before the
+  PSCI line, so whether the board powered off needs the user's eyes.
