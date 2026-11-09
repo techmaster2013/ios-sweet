@@ -20,6 +20,9 @@ struct ContentView: View {
                         }
                     }
                     .disabled(running)
+                    Button("Respring") {
+                        UICache.respring()
+                    }
                 } footer: {
                     if let lastRun {
                         Text("Last reload \(lastRun.formatted(date: .omitted, time: .standard)) · \(results.count) app(s)")

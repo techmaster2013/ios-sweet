@@ -117,6 +117,46 @@ enum UICache {
         appBundles().compactMap { register(bundle: $0) }
     }
 
+    /// How LaunchServices sees an app after registration (LSApplicationProxy).
+    static func describe(_ bundleID: String) -> String {
+        guard let cls = NSClassFromString("LSApplicationProxy") as? NSObject.Type else { return "no LSApplicationProxy" }
+        let sel = NSSelectorFromString("applicationProxyForIdentifier:")
+        guard cls.responds(to: sel),
+              let proxy = cls.perform(sel, with: bundleID)?.takeUnretainedValue() as? NSObject else { return "no proxy" }
+        func val(_ key: String) -> String {
+            guard proxy.responds(to: NSSelectorFromString(key)) else { return "?" }
+            return String(describing: proxy.value(forKey: key) ?? "nil")
+        }
+        var appState = "?"
+        if proxy.responds(to: NSSelectorFromString("appState")),
+           let st = proxy.value(forKey: "appState") as? NSObject {
+            appState = "installed=\(st.value(forKey: "isInstalled") ?? "?") valid=\(st.value(forKey: "isValid") ?? "?")"
+        }
+        return "type=\(val("applicationType")) installed=\(val("isInstalled")) \(appState) " +
+            "launchProhibited=\(val("isLaunchProhibited")) tags=\(val("appTags")) path=\(val("bundleURL"))"
+    }
+
+    /// Restart SpringBoard so it rebuilds its icon list (a "respring").
+    static func respring() {
+        var name = [Int32](arrayLiteral: CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0)
+        var size = 0
+        guard sysctl(&name, 4, nil, &size, nil, 0) == 0, size > 0 else { return }
+        let count = size / MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count + 16)
+        size = procs.count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&name, 4, &procs, &size, nil, 0) == 0 else { return }
+        for i in 0..<(size / MemoryLayout<kinfo_proc>.stride) {
+            var p = procs[i]
+            let comm = withUnsafeBytes(of: &p.kp_proc.p_comm) { raw in
+                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+            }
+            if comm == "SpringBoard" {
+                log("respring: SIGTERM SpringBoard (pid \(p.kp_proc.p_pid))")
+                kill(p.kp_proc.p_pid, SIGTERM)
+            }
+        }
+    }
+
     /// launchd boot job: wait for the system (lsd, SpringBoard) to be up, register
     /// everything, retry a few times, log each step unbuffered, exit.
     static func runBoot() {
@@ -128,8 +168,12 @@ enum UICache {
             let results = reloadAll()
             for r in results {
                 log("\(r.ok ? "registered" : "FAILED") \(r.name) (\(r.bundleID))")
+                log("  -> \(describe(r.bundleID))")
             }
             if !results.isEmpty && results.allSatisfy(\.ok) {
+                // SpringBoard builds its icon list at launch: restart it once.
+                Thread.sleep(forTimeInterval: 2)
+                respring()
                 log("done")
                 return
             }
