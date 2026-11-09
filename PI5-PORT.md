@@ -328,6 +328,32 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   strategy with partition bounds checks, devfs nodes, root via rd=), with
   SDHCI PIO transfers first (DMA later).
 
+### Handoff 2026-11-08 evening
+
+- **Works on the Pi:** internet over iPhone USB tethering (en1 ifnet in
+  sweet_xhci.c + stand-in IONetworkController/IOEthernetInterface in
+  iokit/Kernel/arm/SweetNet.cpp; configd does DHCP/DNS; Safari loads pages),
+  SD High Speed 50 MHz, power button, wheel, About identity.
+- **Card now:** root = image v9 (booted, cleanly unmounted on the last
+  shutdown: journal empty, so it can be patched in place with
+  tools/blockdelta.py + tools/sd-delta-write.ps1); payload = kernel a6b6037
+  (CI 42543469734: PSCI SYSTEM_OFF/RESET for Shut Down/Restart, timestamps on
+  every on-card log line) + `xhciscroll=8`.
+- **Apps (PiInfo, PiStrap, uicache reload) not on the home screen:** the boot
+  job (launchd com.ipados-rpi5.uicache, waits 60 s) registers all three via
+  LSApplicationWorkspace: LSApplicationProxy says type=System installed=1
+  valid=1 launchProhibited=0; it then SIGTERMs SpringBoard, which restarts,
+  and still shows no icons. Open question to the user: do Spotlight / App
+  Library show them? Info.plist differences vs Apple apps: no DTPlatformName/
+  DTSDK*, CFBundleIconFile instead of CFBundleIcons, no scene manifest; apps
+  registered without a data container. Signed with tools/adhoc_sign.py.
+- **Boot time:** the slow first logo is the fresh-volume first boot (every
+  full rewrite); next boot with the timestamp kernel shows where time goes.
+- **Open:** iPad Storage crash ([MPMediaLibrary defaultMediaLibrary]
+  databasePath nil), Photos (root album list empty: photo library never
+  created), Metal (IOAcceleratorES + MetalPluginName/MetalPluginClassName,
+  initWithAcceleratorPort:), Wi-Fi research, PiStrap real install.
+
 ### Plans: USB tethering, Metal (2026-11-08)
 
 - **USB tethering to an iPhone** (network without a router cable): xHCI bulk
