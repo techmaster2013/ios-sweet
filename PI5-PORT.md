@@ -505,3 +505,14 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   Rest of boot: launchd 32.7 s, SpringBoard 39.8 s.
 - Shutdown: launchd teardown + unmount ran cleanly; the log ends before the
   PSCI line, so whether the board powered off needs the user's eyes.
+
+### 2026-11-09 evening: apps visible, shutdown works, boot 30 s faster
+
+- Hidden apps fixed: `SBShowNonDefaultSystemApps = true` in
+  /var/mobile/Library/Preferences/com.apple.springboard.plist (v11 delta,
+  9 blocks). FrontBoard's library had listed them all along. Apps appear.
+- Shut Down powers the Pi off (PSCI SYSTEM_OFF) - confirmed by the user.
+- Kernel 7acde54 (CI 42695193321, macos-15-intel runner: arm64 runners were
+  out of capacity): root at 2.3 s, launchd 2.3 s, SpringBoard 9.3 s.
+- Payload now xhciscroll=24 (8 still too slow); not yet judged.
+- Card: root = v11 (card copy 754f6c56... + delta), payload fca708ca...
