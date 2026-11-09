@@ -145,6 +145,7 @@ python3 tools/sweet-log.py log-area.bin boot.txt
 | `sdhs=0`, `sdclk=HZ` | Stay at default speed (25 MHz) instead of High Speed; cap the SD clock |
 | `xhci=0` | Disable the USB driver |
 | `xhcidebug=1` | Log every USB report and interface |
+| `sweetfb_hz=N` | How often the frame is copied to the HDMI screen (default 10; the payload now uses 30) |
 | `xhciscroll=N` | Scale (negative: invert) the mouse wheel (payload default now 24; 8 was still too slow) |
 | `sweethidtest=N` | Press Home every N seconds (input-free testing) |
 
@@ -154,7 +155,7 @@ Our own apps live in [apps](apps). They are SwiftUI projects built with [xtool](
 
 | App | What it does |
 | --- | --- |
-| [PiInfo](apps/PiInfo) | System information: device and board, iPadOS version and build, kernel version, CPU cores, memory, storage, screen, uptime, time zone. On the Pi port it recognizes our kernel and shows **Raspberry Pi 5**; on Apple hardware it shows the iPhone/iPad. |
+| [PiInfo](apps/PiInfo) | System information: device and board, iPadOS version and build, kernel version, CPU cores, memory, storage, screen, uptime, time zone. On the Pi port it recognizes our kernel and shows **Raspberry Pi 5** as the hardware, with the iPad identity iPadOS runs under (iPad7,5 / J71bAP) labelled as such; on Apple hardware it shows the iPhone/iPad. |
 | [PiStrap](apps/PiStrap) | The jailbreak installer, in the style of Dopamine: one **Jailbreak** button plus options for Sileo, Zebra, TrollStore Lite, ElleKit and Cydia (Cydia uses the classic rootful layout, the rest rootless `/var/jb`). **Preview:** the steps (Procursus bootstrap, apt sources, package managers, `uicache`) are shown but not run yet; they need network and the bootstrap packages. |
 | [uicache reload](apps/UICacheReload) | Registers apps with iPadOS's app database (LaunchServices), like the jailbreak `uicache` tool, so apps copied into `/Applications` or `/var/jb/Applications` appear on the home screen. Opening it re-registers every non-Apple app and lists the results; a launchd job also runs it once at boot (`--boot`, about 20 s after it starts; no respring needed, SpringBoard picks the apps up live; this build is not yet on the card). It also has a Respring button. No icon. |
 

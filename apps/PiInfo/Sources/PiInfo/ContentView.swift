@@ -102,8 +102,15 @@ struct ContentView: View {
                         InfoRow(label: "Name", value: UIDevice.current.name)
                         InfoRow(label: UIDevice.current.systemName,
                                 value: "\(UIDevice.current.systemVersion) (\(SystemInfo.osBuild))")
-                        InfoRow(label: "Identifier", value: u.machine)
-                        InfoRow(label: "Board", value: SystemInfo.hwModel)
+                        if SystemInfo.isRaspberryPi {
+                            // iPadOS needs a real iPad identity to run; show it, but
+                            // say plainly what the hardware is.
+                            InfoRow(label: "Hardware", value: "Raspberry Pi 5 (BCM2712, 4× Cortex-A76)")
+                            InfoRow(label: "iPadOS identity", value: "\(u.machine) (\(SystemInfo.hwModel))")
+                        } else {
+                            InfoRow(label: "Identifier", value: u.machine)
+                            InfoRow(label: "Board", value: SystemInfo.hwModel)
+                        }
                         InfoRow(label: "Kernel", value: "Darwin \(u.release)")
                         InfoRow(label: "Uptime", value: SystemInfo.duration(p.systemUptime))
                     }
