@@ -516,3 +516,16 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   out of capacity): root at 2.3 s, launchd 2.3 s, SpringBoard 9.3 s.
 - Payload now xhciscroll=24 (8 still too slow); not yet judged.
 - Card: root = v11 (card copy 754f6c56... + delta), payload fca708ca...
+
+### 2026-11-09 night: queued for the next card trip
+
+- Kernel 8c3361e (CI 42719715264): Wi-Fi step 1 (bsd/dev/sweet_wifi.c: WL_ON
+  GPIO 28, SDIO host 0x1001100000, CMD5/3/7, function 1, chip ID; logs the
+  pinctrl mux for pins 30..35, boot-arg wifimux=N to set it) + CPU clock log.
+- Payload: sweetfb_hz=30 (was default 10 = the main reason the screen looks
+  choppy), xhciscroll=24.
+- Root v12 (make-v12.sh in scratchpad; needs a fresh card read first since the
+  card was booted): uicache reload without respring (20 s wait), PiInfo with a
+  Hardware row, PiStrap with the setuid-root helper + bundled packages
+  (~29 MB), AssistiveTouch on (com.apple.Accessibility AssistiveTouchEnabled).
+- If the CPU clock log is low: config.txt force_turbo=1 (firmware still throttles).
