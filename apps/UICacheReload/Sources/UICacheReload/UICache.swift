@@ -160,8 +160,8 @@ enum UICache {
     /// launchd boot job: wait for the system (lsd, SpringBoard) to be up, register
     /// everything, retry a few times, log each step unbuffered, exit.
     static func runBoot() {
-        log("boot job started, waiting 60 s for the system to come up")
-        Thread.sleep(forTimeInterval: 60)
+        log("boot job started, waiting 20 s for the system to come up")
+        Thread.sleep(forTimeInterval: 20)
         log("apps found: \(appBundles().joined(separator: ", "))")
         for attempt in 1...5 {
             log("attempt \(attempt): LSApplicationWorkspace \(workspace == nil ? "MISSING" : "ok")")
@@ -171,9 +171,8 @@ enum UICache {
                 log("  -> \(describe(r.bundleID))")
             }
             if !results.isEmpty && results.allSatisfy(\.ok) {
-                // SpringBoard builds its icon list at launch: restart it once.
-                Thread.sleep(forTimeInterval: 2)
-                respring()
+                // No respring: with SBShowNonDefaultSystemApps set, SpringBoard
+                // picks newly registered apps up live (the Respring button stays).
                 log("done")
                 return
             }
