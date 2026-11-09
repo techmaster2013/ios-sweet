@@ -349,6 +349,10 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   registered without a data container. Signed with tools/adhoc_sign.py.
 - **Boot time:** the slow first logo is the fresh-volume first boot (every
   full rewrite); next boot with the timestamp kernel shows where time goes.
+- **Tomorrow:** boot (check Spotlight/App Library for the apps, faster wheel,
+  Shut Down powers off?), read the timestamped log (boot time); try
+  `wsl --mount \\.\PHYSICALDRIVE1 --bare` (admin; may refuse the built-in SD
+  reader) so Linux can edit the root partition directly.
 - **Open:** iPad Storage crash ([MPMediaLibrary defaultMediaLibrary]
   databasePath nil), Photos (root album list empty: photo library never
   created), Metal (IOAcceleratorES + MetalPluginName/MetalPluginClassName,
