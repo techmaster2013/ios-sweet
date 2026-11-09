@@ -1,19 +1,25 @@
 import SwiftUI
 
-/// What PiStrap can install. The install steps are a preview until the
-/// bootstrap packages ship in the image (see apps/PiStrap/README in the repo).
+import Darwin
+
+/// What PiStrap can install. Packages come from PiStrap.app/Packages or
+/// /var/mobile/Library/PiStrap (see apps/PiStrap/README.md in the repo).
 struct StrapOptions {
     var sileo = true
     var zebra = false
     var trollStoreLite = true
-    var cydia = false          // needs the rootful ("classic") layout
+    var cydia = false          // needs the rootful ("classic") layout: not offered yet
     var ellekit = true
-
-    var rootful: Bool { cydia }
 }
 
 enum StrapState: Equatable {
-    case idle, running, done
+    case idle, running, done, failed
+}
+
+/// One package file PiStrap looks for, by file-name prefix.
+struct PackageSpec {
+    let title: String
+    let prefixes: [String]
 }
 
 @MainActor
@@ -22,34 +28,118 @@ final class Strapper: ObservableObject {
     @Published var log: [String] = []
     @Published var options = StrapOptions()
 
-    /// The real steps, in order. In this preview each one is only announced.
-    func steps() -> [String] {
-        var s = [
-            options.rootful ? "Preparing the classic (rootful) layout in /" : "Creating /var/jb (rootless)",
-            "Extracting the Procursus bootstrap",
-            "Setting up apt sources",
-        ]
-        if options.ellekit { s.append("Installing ElleKit (tweak injection)") }
-        if options.sileo { s.append("Installing Sileo") }
-        if options.zebra { s.append("Installing Zebra") }
-        if options.cydia { s.append("Installing Cydia") }
-        if options.trollStoreLite { s.append("Installing TrollStore Lite") }
-        s.append("Registering apps (uicache)")
+    nonisolated static let userDir = "/var/mobile/Library/PiStrap"
+    nonisolated static var appPackages: String { Bundle.main.bundlePath + "/Packages" }
+    nonisolated static var helper: String { Bundle.main.bundlePath + "/pistrap-helper" }
+
+    /// Package files available on the device (bundle first, then the user folder).
+    static func packageFiles() -> [String] {
+        var out: [String] = []
+        for dir in [appPackages, userDir] {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            out += names.sorted().map { dir + "/" + $0 }
+        }
+        return out
+    }
+
+    static func find(_ spec: PackageSpec, in files: [String]) -> String? {
+        files.first { path in
+            let name = (path as NSString).lastPathComponent.lowercased()
+            return spec.prefixes.contains { name.hasPrefix($0) }
+        }
+    }
+
+    func selectedDebs() -> [PackageSpec] {
+        var s: [PackageSpec] = []
+        if options.ellekit { s.append(PackageSpec(title: "ElleKit", prefixes: ["ellekit"])) }
+        if options.sileo { s.append(PackageSpec(title: "Sileo", prefixes: ["org.coolstar.sileo", "sileo"])) }
+        if options.zebra { s.append(PackageSpec(title: "Zebra", prefixes: ["xyz.willy.zebra", "zebra"])) }
+        if options.trollStoreLite {
+            s.append(PackageSpec(title: "TrollStore Lite", prefixes: ["com.opa334.trollstorelite", "trollstorelite", "trollstore-lite"]))
+        }
         return s
+    }
+
+    /// Run the root helper; each output line goes to the log. Returns the exit status.
+    nonisolated static func runHelper(_ args: [String], line: @escaping @Sendable (String) -> Void) -> Int32 {
+        var fds: [Int32] = [0, 0]
+        guard pipe(&fds) == 0 else { line("error: pipe failed"); return -1 }
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        posix_spawn_file_actions_adddup2(&actions, fds[1], 1)
+        posix_spawn_file_actions_adddup2(&actions, fds[1], 2)
+        posix_spawn_file_actions_addclose(&actions, fds[0])
+        let argv = ([helper] + args).map { strdup($0) } + [nil]
+        var pid: pid_t = 0
+        let rc = posix_spawn(&pid, helper, &actions, nil, argv, environ)
+        posix_spawn_file_actions_destroy(&actions)
+        argv.forEach { free($0) }
+        close(fds[1])
+        guard rc == 0 else {
+            close(fds[0])
+            line("error: cannot start the helper (\(String(cString: strerror(rc))))")
+            return -1
+        }
+        let fh = FileHandle(fileDescriptor: fds[0], closeOnDealloc: true)
+        var buffer = Data()
+        while true {
+            let chunk = fh.availableData
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let nl = buffer.firstIndex(of: 10) {
+                line(String(decoding: buffer[buffer.startIndex..<nl], as: UTF8.self))
+                buffer.removeSubrange(buffer.startIndex...nl)
+            }
+        }
+        if !buffer.isEmpty { line(String(decoding: buffer, as: UTF8.self)) }
+        var status: Int32 = 0
+        waitpid(pid, &status, 0)
+        return (status & 0x7f) == 0 ? (status >> 8) & 0xff : -1
     }
 
     func run() {
         guard state != .running else { return }
         state = .running
-        log = ["PiStrap preview: nothing is changed on this device."]
-        Task {
-            for step in steps() {
-                log.append("• \(step)…")
-                try? await Task.sleep(nanoseconds: 450_000_000)
-            }
-            log.append("Done (preview). The real install arrives with network + bootstrap packages.")
-            state = .done
+        log = []
+        let files = Self.packageFiles()
+        let bootstrap = Self.find(PackageSpec(title: "Procursus bootstrap", prefixes: ["bootstrap"]), in: files)
+        let debs = selectedDebs().map { ($0.title, Self.find($0, in: files)) }
+        let say: @Sendable (String) -> Void = { [weak self] s in
+            Task { @MainActor in self?.log.append(s) }
         }
+        let finish: @Sendable (Bool) -> Void = { [weak self] ok in
+            Task { @MainActor in
+                self?.log.append(ok ? "Done." : "Stopped: see the messages above.")
+                self?.state = ok ? .done : .failed
+            }
+        }
+        Task.detached {
+            finish(Strapper.work(bootstrap: bootstrap, debs: debs, say: say))
+        }
+    }
+
+    /// The install itself, off the main thread. Returns true on success.
+    nonisolated static func work(bootstrap: String?, debs: [(String, String?)],
+                                 say: @escaping @Sendable (String) -> Void) -> Bool {
+        func step(_ title: String, _ args: [String]) -> Bool {
+            say("• \(title)")
+            return runHelper(args, line: { say("  " + $0) }) == 0
+        }
+        guard step("Checking the root helper", ["status"]) else { return false }
+        guard let b = bootstrap else {
+            say("✗ No Procursus bootstrap on this device (bootstrap-*.tar* in PiStrap.app/Packages or \(userDir))")
+            return false
+        }
+        guard step("Installing the Procursus bootstrap into /var/jb", ["bootstrap", b]) else { return false }
+        for (title, path) in debs where path == nil {
+            say("✗ \(title): package not on this device yet, skipped")
+        }
+        let present = debs.compactMap { $0.1 }
+        if !present.isEmpty {
+            let names = debs.filter { $0.1 != nil }.map { $0.0 }.joined(separator: ", ")
+            guard step("Installing " + names, ["install"] + present) else { return false }
+        }
+        return step("Registering apps (uicache)", ["uicache"])
     }
 }
 
@@ -113,7 +203,7 @@ struct ContentView: View {
                 }
 
                 Spacer(minLength: 20)
-                Text("ipados-rpi5 · preview build")
+                Text("ipados-rpi5 · rootless Procursus in /var/jb")
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.5))
             }
@@ -134,7 +224,8 @@ struct ContentView: View {
         switch strapper.state {
         case .idle: return "Jailbreak"
         case .running: return "Jailbreaking…"
-        case .done: return "Jailbroken (preview)"
+        case .done: return "Jailbroken"
+        case .failed: return "Try again"
         }
     }
 
@@ -186,8 +277,9 @@ struct ManagersView: View {
                 }
                 Section {
                     Toggle("Cydia (classic)", isOn: $options.cydia)
+                        .disabled(true)
                 } footer: {
-                    Text("Cydia needs the old rootful layout in /. Most modern tweaks expect rootless, so leave this off unless you want Cydia.")
+                    Text("Cydia needs the old rootful layout in /. PiStrap installs rootless (/var/jb) for now, so Cydia is not offered yet.")
                 }
                 Section {
                     Button {
@@ -197,7 +289,7 @@ struct ManagersView: View {
                             .font(.headline)
                             .frame(maxWidth: .infinity)
                     }
-                    .disabled(!(options.sileo || options.zebra || options.trollStoreLite || options.cydia))
+                    .disabled(!(options.sileo || options.zebra || options.trollStoreLite))
                 }
             }
             .navigationTitle("Choose package managers")

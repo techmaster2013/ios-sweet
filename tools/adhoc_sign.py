@@ -109,6 +109,7 @@ def main():
         sys.exit('not a thin 64-bit Mach-O (fat binaries: thin them first)')
     off = 32
     sig = None
+    linkedit = None
     text_limit = 0
     for _ in range(ncmds):
         cmd, size = struct.unpack_from('<II', data, off)
@@ -116,6 +117,8 @@ def main():
             sig = (off, *struct.unpack_from('<II', data, off + 8))
         elif cmd == 0x19 and data[off + 8:off + 24].rstrip(b'\0') == b'__TEXT':
             text_limit = struct.unpack_from('<Q', data, off + 48)[0]    # filesize
+        elif cmd == 0x19 and data[off + 8:off + 24].rstrip(b'\0') == b'__LINKEDIT':
+            linkedit = off
         off += size
     if not sig:
         sys.exit('no LC_CODE_SIGNATURE: sign it once first')
@@ -141,21 +144,36 @@ def main():
         if os.path.exists(res):
             special[3] = hashlib.sha256(open(res, 'rb').read()).digest()
 
-    cd = code_directory(bytes(data[:dataoff]), ident, special, text_limit)
-    entries = [(CSSLOT_CODEDIRECTORY, cd), (CSSLOT_REQUIREMENTS, req),
-               (CSSLOT_ENTITLEMENTS, ent_blob), (CSSLOT_DER, der_blob)]
-    index_len = 12 + 8 * len(entries)
-    out = bytearray()
-    pos = index_len
-    index = b''
-    for slot, b in entries:
-        index += struct.pack('>II', slot, pos)
-        pos += len(b)
-    out += struct.pack('>III', CSMAGIC_EMBEDDED_SIGNATURE, pos, len(entries)) + index
-    for _, b in entries:
-        out += b
+    def superblob():
+        cd = code_directory(bytes(data[:dataoff]), ident, special, text_limit)
+        entries = [(CSSLOT_CODEDIRECTORY, cd), (CSSLOT_REQUIREMENTS, req),
+                   (CSSLOT_ENTITLEMENTS, ent_blob), (CSSLOT_DER, der_blob)]
+        out = bytearray()
+        pos = 12 + 8 * len(entries)
+        index = b''
+        for slot, b in entries:
+            index += struct.pack('>II', slot, pos)
+            pos += len(b)
+        out += struct.pack('>III', CSMAGIC_EMBEDDED_SIGNATURE, pos, len(entries)) + index
+        for _, b in entries:
+            out += b
+        return out
+
+    out = superblob()
     if len(out) > datasize:
-        sys.exit(f'new signature ({len(out)} bytes) does not fit the old one ({datasize})')
+        if dataoff + datasize != len(data) or linkedit is None:
+            sys.exit(f'new signature ({len(out)} bytes) does not fit the old one ({datasize})')
+        # The signature ends the file (a fresh linker signature): grow it, and
+        # __LINKEDIT with it. The load commands are hashed, so patch them first.
+        grow = ((len(out) + 15) & ~15) - datasize
+        datasize += grow
+        struct.pack_into('<I', data, sig[0] + 12, datasize)
+        lo = linkedit
+        filesize = struct.unpack_from('<Q', data, lo + 48)[0] + grow
+        struct.pack_into('<Q', data, lo + 48, filesize)
+        struct.pack_into('<Q', data, lo + 32, (filesize + 0x3fff) & ~0x3fff)     # vmsize
+        data += b'\0' * grow
+        out = superblob()
     data[dataoff:dataoff + datasize] = bytes(out) + b'\0' * (datasize - len(out))
     open(path, 'wb').write(data)
     print(f'{path}: ad-hoc signed as {ident}, {len(ents)} entitlements, '
