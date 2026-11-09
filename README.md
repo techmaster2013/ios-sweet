@@ -25,7 +25,7 @@ As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on
 | Mouse | USB mice with the native iPadOS pointer; buttons, wheel and horizontal scroll (report descriptor parsed; `xhciscroll=N` sets the wheel speed) |
 | Network | **Internet through an iPhone's Personal Hotspot over USB** (Apple USB Ethernet, like Linux `ipheth`): the link appears as `en1` / "Ethernet" in Settings, iPadOS does DHCP, routing and DNS itself, Safari loads pages. No pairing needed |
 | Power button | The Pi's power button is the iPad side button (lock/wake); holding it brings up iPadOS's power-off slider |
-| Shut Down / Restart | Settings → General → Shut Down and Restart go to the Pi firmware (PSCI SYSTEM_OFF / SYSTEM_RESET); the root volume is unmounted cleanly first. The power button starts the Pi again. *(Power-off is new and not yet confirmed on hardware; before it, shutdown ended in a "Halt/Restart Timed Out" panic after the clean unmount.)* |
+| Shut Down / Restart | Settings → General → Shut Down and Restart go to the Pi firmware (PSCI SYSTEM_OFF / SYSTEM_RESET); the root volume is unmounted cleanly first. The power button starts the Pi again. Confirmed on the Pi: Shut Down powers the board off. |
 | Device identity | iPad (6th generation), Wi-Fi (`iPad7,5` / `J71bAP`) userland; About shows Model Name "Raspberry Pi 5", Model Number "RPI5" and the board's own serial number |
 | Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
 | Debugging | Every console line (kernel and daemons), with the time since boot, is saved to a log partition on the SD card; crash addresses can be symbolized against the shared cache with `tools/dsc_sym.py` |
@@ -35,10 +35,11 @@ As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on
 - **No Wi-Fi, Bluetooth, the Pi's own Ethernet port, audio or camera.** The Wi-Fi switch does nothing; Bluetooth is greyed out (its daemon is disabled). Internet works through an iPhone instead (see Network above).
 - **No GPU.** Widgets show as white tiles, translucent "material" backgrounds (the dock) come and go, and everything is slower than it should be.
 - **Some apps and pages crash:** Photos (the photo library is never created, so its album list is empty) and Settings → General → iPad Storage (the media library has no database, so `[MPMediaLibrary defaultMediaLibrary].databasePath` is nil).
-- **Our own apps don't show on the home screen yet:** they are registered (LaunchServices reports them installed and valid) and SpringBoard is restarted, but it still leaves them out.
+- **Our own apps don't show on the home screen yet:** LaunchServices and FrontBoard both list them (installed, valid), but SpringBoard hides apps of type *System* that are not on Apple's default list. The fix being tried is the SpringBoard preference `SBShowNonDefaultSystemApps = true` (what Cydia-era jailbreaks set); not yet confirmed on the Pi.
 - **USB hubs** are not supported: plug the keyboard and mouse straight into the Pi.
 - **The clock** starts from the time the payload was built unless the network is up (no RTC driver).
 - **The first boot of a freshly written root image is slow** (about 10 minutes on the first Apple logo); later boots are much faster.
+- The kernel no longer waits 30 s for a real-time clock that this port does not drive (IORTC), so the first Apple logo now passes in a couple of seconds (measured: root mounted at 2.3 s instead of 32 s, SpringBoard at 9.3 s instead of 40 s); the date and time come from `sweettime=` in the payload.
 - **Storage is still slowish:** 50 MHz with CPU-copied (PIO) transfers, no DMA or UHS modes yet, so apps take a while to open.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection.
 
@@ -144,7 +145,7 @@ python3 tools/sweet-log.py log-area.bin boot.txt
 | `sdhs=0`, `sdclk=HZ` | Stay at default speed (25 MHz) instead of High Speed; cap the SD clock |
 | `xhci=0` | Disable the USB driver |
 | `xhcidebug=1` | Log every USB report and interface |
-| `xhciscroll=N` | Scale (negative: invert) the mouse wheel |
+| `xhciscroll=N` | Scale (negative: invert) the mouse wheel (payload default now 24; 8 was still too slow) |
 | `sweethidtest=N` | Press Home every N seconds (input-free testing) |
 
 ## Apps
