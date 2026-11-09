@@ -6,7 +6,7 @@
 
 This project boots Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) on a Raspberry Pi 5, with the **unmodified iPadOS 16.6.1 (20G81) userland of the iPad (6th generation)** on top: launchd, the system daemons, backboardd, SpringBoard and the stock apps. It is built on [ios-sweet](https://github.com/dipa-studio/ios-sweet), which did the same for the Redmi Note 10 Pro; that project's README is kept in [docs/README-sweet.md](docs/README-sweet.md).
 
-As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on HDMI**, in landscape. A USB keyboard and mouse work: you can unlock it, open apps (Settings, Messages, Safari, the App Library) and type. Rendering runs entirely on the CPU; there is no GPU driver.
+As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on HDMI**, in landscape. A USB keyboard and mouse work: you can unlock it, open apps (Settings, Messages, Safari, the App Library) and type, and with an iPhone plugged in as a USB hotspot **Safari browses the web**. Rendering runs entirely on the CPU; there is no GPU driver.
 
 > Experimental bring-up, not a usable tablet OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. Do not put anything personal on it.
 
@@ -17,26 +17,29 @@ As of **2026-11-08** the Pi boots to the **iPadOS lock screen and home screen on
 | Boot | Pi firmware → our shim (`ios-pi5-shim.img`) → XNU. The Pi's EEPROM and firmware are untouched |
 | CPU | All 4 Cortex-A76 cores (PSCI), GICv2 (GIC-400) interrupts and IPIs, 16K pages |
 | Memory | 3 GiB for XNU on 4/8/16 GB boards (about 1 GiB on 2 GB boards) |
-| Storage | Own SD host (SDHCI) driver; the iPadOS root is a journaled HFS+ volume on SD partition 3, read/write |
+| Storage | Own SD host (SDHCI) driver, High Speed mode (50 MHz, 4-bit); the iPadOS root is a journaled HFS+ volume on SD partition 3, read/write |
 | iPadOS userland | Real iPadOS 16.6.1 root filesystem and shared cache; launchd and the system daemons run |
 | Display | The firmware's HDMI framebuffer, presented to iPadOS at its native size (1920×1080 here); CoreAnimation renders in software |
 | GUI | backboardd, SpringBoard, lock screen, home screen, dock, App Library, Settings, Messages, Safari |
 | Keyboard | USB keyboards (boot protocol) through our own xHCI driver for RP1's USB controllers. **Esc** or **F1** = Home button, **F2** = side (lock) button |
-| Mouse | USB mice with the native iPadOS pointer; buttons, wheel (report descriptor parsed) |
+| Mouse | USB mice with the native iPadOS pointer; buttons, wheel and horizontal scroll (report descriptor parsed; `xhciscroll=N` sets the wheel speed) |
 | Network | **Internet through an iPhone's Personal Hotspot over USB** (Apple USB Ethernet, like Linux `ipheth`): the link appears as `en1` / "Ethernet" in Settings, iPadOS does DHCP, routing and DNS itself, Safari loads pages. No pairing needed |
-| Power button | The Pi's power button is the iPad side button (lock/wake); holding it still cuts power in hardware |
+| Power button | The Pi's power button is the iPad side button (lock/wake); holding it brings up iPadOS's power-off slider |
+| Shut Down / Restart | Settings → General → Shut Down and Restart go to the Pi firmware (PSCI SYSTEM_OFF / SYSTEM_RESET); the root volume is unmounted cleanly first. The power button starts the Pi again. *(Power-off is new and not yet confirmed on hardware; before it, shutdown ended in a "Halt/Restart Timed Out" panic after the clean unmount.)* |
 | Device identity | iPad (6th generation), Wi-Fi (`iPad7,5` / `J71bAP`) userland; About shows Model Name "Raspberry Pi 5", Model Number "RPI5" and the board's own serial number |
 | Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
-| Debugging | Every console line (kernel and daemons) is saved to a log partition on the SD card |
+| Debugging | Every console line (kernel and daemons), with the time since boot, is saved to a log partition on the SD card; crash addresses can be symbolized against the shared cache with `tools/dsc_sym.py` |
 
 ## What does not work (yet)
 
 - **No Wi-Fi, Bluetooth, the Pi's own Ethernet port, audio or camera.** The Wi-Fi switch does nothing; Bluetooth is greyed out (its daemon is disabled). Internet works through an iPhone instead (see Network above).
 - **No GPU.** Widgets show as white tiles, translucent "material" backgrounds (the dock) come and go, and everything is slower than it should be.
-- **Some apps and pages crash:** Photos (assetsd), Settings → General → iPad Storage (volume capacity on HFS+), Settings → Screen Time.
+- **Some apps and pages crash:** Photos (the photo library is never created, so its album list is empty) and Settings → General → iPad Storage (the media library has no database, so `[MPMediaLibrary defaultMediaLibrary].databasePath` is nil).
+- **Our own apps don't show on the home screen yet:** they are registered (LaunchServices reports them installed and valid) and SpringBoard is restarted, but it still leaves them out.
 - **USB hubs** are not supported: plug the keyboard and mouse straight into the Pi.
-- **The clock** starts from the time the payload was built (no RTC driver, no network time).
-- **Slow storage:** the SD card runs at 25 MHz with CPU-copied (PIO) transfers, so apps take a while to open.
+- **The clock** starts from the time the payload was built unless the network is up (no RTC driver).
+- **The first boot of a freshly written root image is slow** (about 10 minutes on the first Apple logo); later boots are much faster.
+- **Storage is still slowish:** 50 MHz with CPU-copied (PIO) transfers, no DMA or UHS modes yet, so apps take a while to open.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection.
 
 ## How it boots
@@ -138,6 +141,7 @@ python3 tools/sweet-log.py log-area.bin boot.txt
 | `sdlog=0`, `sdlogsecs=N` | Disable the SD console log; flush interval (default 2 s) |
 | `sweetfb_noconsole=1` | Stop drawing kernel text once iPadOS draws its first frame (still logged) |
 | `sweettime=SECONDS` | Initial Unix time for the clock (no RTC driver yet) |
+| `sdhs=0`, `sdclk=HZ` | Stay at default speed (25 MHz) instead of High Speed; cap the SD clock |
 | `xhci=0` | Disable the USB driver |
 | `xhcidebug=1` | Log every USB report and interface |
 | `xhciscroll=N` | Scale (negative: invert) the mouse wheel |
@@ -161,7 +165,8 @@ Build one with `xtool dev build -c release` in its folder (`xtool dev` installs 
 | --- | --- |
 | [xnu/patches](xnu/patches) | Kernel patches: `0001`–`0081` from ios-sweet, `0101-pi5-board-gicv2.patch` for the Pi 5 (GICv2, SMP, SD, USB, HID, …) |
 | [shim-pi5](shim-pi5) | Pi 5 boot shim (stage-1 hardware checks without a payload, XNU loader with one) |
-| [tools](tools) | Device tree (`mkadt_pi5.py`), payload, root image, root tweaks, log decoder |
+| [tools](tools) | Device tree (`mkadt_pi5.py`), payload, root image and root tweaks, log decoder (`sweet-log.py`), ad-hoc signer with entitlements (`adhoc_sign.py`), shared-cache symbolizer (`dsc_sym.py`), changed-block writer for the SD root (`blockdelta.py` + `sd-delta-write.ps1`) |
+| [apps](apps) | Our iPadOS apps: PiInfo, PiStrap, uicache reload (see Apps) |
 | [PI5-PORT.md](PI5-PORT.md) | Detailed Pi 5 port notes: hardware facts, boot logs, what was tried |
 | [NOTES.md](NOTES.md) | The phone port's development notes |
 | `shim`, `site`, `docs` | The phone port's boot shim, website and docs |
@@ -175,7 +180,8 @@ Build one with `xtool dev build -c release` in its folder (`xtool dev` installs 
 | Timer | 54 MHz, virtual timer PPI 27 |
 | UART | PL011 at 0x107d001000 (3-pin debug header) |
 | SD | brcm,bcm2712-sdhci at 0x107cfff000 (+ cfg 0x107cfff400), 200 MHz base clock |
-| USB | RP1 (PCIe x4) DWC3 xHCI ×2 at RP1 BAR1 + 0x200000/0x300000; the firmware maps RP1 at CPU 0x1c00000000 → PCI 0x80000000 |
+| USB | RP1 (PCIe x4) DWC3 xHCI ×2 at RP1 BAR1 + 0x200000/0x300000; the firmware maps RP1 at CPU 0x1c00000000 → PCI 0x80000000 (root port bus numbers and inbound DMA window are set up by the kernel) |
+| iPhone tethering | Configuration 4, interface 2 alt 1 (class ff/fd/01), bulk in/out; frames carry 2 bytes of padding on receive |
 | Power button | GPIO 20 of the brcmstb GPIO block at 0x107d508500, active low |
 
 ## Credits
