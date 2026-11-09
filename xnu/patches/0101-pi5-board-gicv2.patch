@@ -1,22 +1,23 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 6630131..468b01d 100644
+index 6630131..8314347 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
+@@ -105,6 +105,9 @@ bsd/dev/random/randomdev.c		standard
  
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/sweet_sd.c			standard
 +bsd/dev/sweet_xhci.c			standard
++bsd/dev/sweet_wifi.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
 new file mode 100644
-index 0000000..4812b1f
+index 0000000..8b983d9
 --- /dev/null
 +++ b/bsd/dev/sweet_sd.c
-@@ -0,0 +1,876 @@
+@@ -0,0 +1,882 @@
 +/*
 + * SWEET (Raspberry Pi 5) SD card root device.
 + *
@@ -64,6 +65,9 @@ index 0000000..4812b1f
 +extern uint64_t sweet_log_position(void);
 +static void sweet_sd_log_start(void);
 +extern void sweet_xhci_start(void);
++#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++extern void sweet_wifi_start(void);
++#endif
 +
 +/* SDHCI registers, all accessed as aligned 32-bit words. */
 +#define SD_BLK          0x04    /* [11:0] block size, [31:16] block count */
@@ -760,6 +764,9 @@ index 0000000..4812b1f
 +	    sd.first_block, sd.nblocks >> 11, sd.writable ? "read-write" : "read-only");
 +	sweet_sd_log_start();
 +	sweet_xhci_start();             /* USB keyboard/mouse (bsd/dev/sweet_xhci.c) */
++#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++	sweet_wifi_start();             /* CYW43455 over SDIO (bsd/dev/sweet_wifi.c) */
++#endif
 +	return 0;
 +}
 +
@@ -939,6 +946,423 @@ index 6b926fe..7ed5036 100644
  	}
  }
  
+diff --git a/bsd/dev/sweet_wifi.c b/bsd/dev/sweet_wifi.c
+new file mode 100644
+index 0000000..1755700
+--- /dev/null
++++ b/bsd/dev/sweet_wifi.c
+@@ -0,0 +1,411 @@
++/*
++ * SWEET (Raspberry Pi 5) Wi-Fi, step 1: bring up the CYW43455 over SDIO and
++ * read its chip ID. No network yet.
++ *
++ * Hardware (bcm2712-rpi-5-b.dtb):
++ *  - SDIO host /axi/mmc@1100000, brcm,bcm2712-sdhci (standard SDHCI):
++ *    host regs PA 0x1001100000 (+0x260), brcmstb cfg PA 0x1001100400.
++ *  - WL_ON = GPIO 28 of the brcmstb GPIO block at PA 0x107d508500 (bank 0:
++ *    DATA +0x04, IODIR +0x08 with 1 = input), active high, 150 ms start-up.
++ *  - SDIO pins 30..35 (clk, cmd, d0..d3) muxed to "sd2" by the pinctrl at
++ *    PA 0x107d504100 (4 bits per pin, 8 pins per word). The firmware may or
++ *    may not have set them: the driver logs what it finds, and boot-arg
++ *    wifimux=N (1..8) writes alt function N for pins 30..35 if they are on
++ *    function 0 (GPIO). Without a working mux CMD5 simply times out.
++ *
++ * Polled PIO, CMD52 (single byte) only; boot-arg wifi=0 skips the driver.
++ * Output: "SWEET WIFI: chip 0x4345 rev N" when the chip answers.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++#define WF_HOST_PA      0x1001100000ull
++#define WF_CFG_PA       0x1001100400ull
++#define GIO_PA          0x107d508500ull
++#define PINCTRL_PA      0x107d504100ull
++#define WL_ON_PIN       28u
++
++/* SDHCI registers (same layout as bsd/dev/sweet_sd.c). */
++#define H_BLK           0x04
++#define H_ARG           0x08
++#define H_XFER          0x0c
++#define H_RESP0         0x10
++#define H_PRESENT       0x24
++#define H_HOSTCTL       0x28    /* [7:0] host control 1, [15:8] power control */
++#define H_CLKCTL        0x2c
++#define H_INT           0x30
++#define H_INT_EN        0x34
++#define H_SIG_EN        0x38
++#define H_CTRL2         0x3c
++#define H_CAPS          0x40
++#define H_VERSION       0xfc
++
++#define PRES_CMD_INH    (1u << 0)
++#define PRES_DAT_INH    (1u << 1)
++#define INT_CMD_DONE    (1u << 0)
++#define INT_ERR         (1u << 15)
++#define CLK_INT_EN      (1u << 0)
++#define CLK_INT_STABLE  (1u << 1)
++#define CLK_CARD_EN     (1u << 2)
++#define RST_ALL         (1u << 24)
++#define RST_CMD         (1u << 25)
++#define RST_DAT         (1u << 26)
++#define HC1_4BIT        (1u << 1)
++
++#define R_NONE          0x00
++#define R_R3            0x02    /* 48-bit, no CRC / index check: R4 */
++#define R_R1            0x1a    /* R1, R5, R6 */
++#define R_R1B           0x1b
++
++/* SDIO / Broadcom function 1 registers. */
++#define CCCR_REV        0x00
++#define CCCR_IOEN       0x02
++#define CCCR_IORDY      0x03
++#define CCCR_BUSIF      0x07
++#define CCCR_CAPS       0x08
++#define F1_SBADDR_LOW   0x1000a
++#define F1_SBADDR_MID   0x1000b
++#define F1_SBADDR_HIGH  0x1000c
++#define F1_CHIPCLKCSR   0x1000e
++#define CLK_ALP_REQ     0x08
++#define CLK_HW_REQ_OFF  0x20
++#define CLK_ALP_AVAIL   0x40
++#define SB_ACCESS_4B    0x8000
++#define CHIPCOMMON      0x18000000u
++
++static struct {
++	vm_offset_t regs, cfg, gio, pinctrl;
++	uint32_t base_hz;
++	uint32_t rca;
++} wf;
++
++static inline uint32_t h_rd(uint32_t o) { return *(volatile uint32_t *)(wf.regs + o); }
++static inline void h_wr(uint32_t o, uint32_t v) { *(volatile uint32_t *)(wf.regs + o) = v; }
++static inline uint32_t g_rd(uint32_t o) { return *(volatile uint32_t *)(wf.gio + o); }
++static inline void g_wr(uint32_t o, uint32_t v) { *(volatile uint32_t *)(wf.gio + o) = v; }
++static inline uint32_t p_rd(uint32_t o) { return *(volatile uint32_t *)(wf.pinctrl + o); }
++static inline void p_wr(uint32_t o, uint32_t v) { *(volatile uint32_t *)(wf.pinctrl + o) = v; }
++
++static int
++h_wait(uint32_t off, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	uint64_t deadline, t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	deadline = mach_absolute_time() + t;
++	while ((h_rd(off) & mask) != want) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++static void
++h_reset(uint32_t bits)
++{
++	h_wr(H_CLKCTL, h_rd(H_CLKCTL) | bits);
++	if (h_wait(H_CLKCTL, bits, 0, 100)) {
++		printf("SWEET WIFI: host reset 0x%x did not complete\n", bits);
++	}
++}
++
++/* One command, no data. quiet: a timeout is expected (probing). */
++static int
++h_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp, bool quiet)
++{
++	uint32_t inhibit = PRES_CMD_INH | (flags == R_R1B ? PRES_DAT_INH : 0);
++	if (h_wait(H_PRESENT, inhibit, 0, 100)) {
++		printf("SWEET WIFI: CMD%u: line busy (present 0x%x)\n", idx, h_rd(H_PRESENT));
++		h_reset(RST_CMD | RST_DAT);
++		return ETIMEDOUT;
++	}
++	h_wr(H_INT, 0xffffffff);
++	h_wr(H_ARG, arg);
++	h_wr(H_XFER, (idx << 8 | flags) << 16);
++	uint64_t deadline, t;
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &t);
++	deadline = mach_absolute_time() + t;
++	uint32_t st;
++	while (!((st = h_rd(H_INT)) & (INT_CMD_DONE | INT_ERR))) {
++		if (mach_absolute_time() > deadline) {
++			if (!quiet) {
++				printf("SWEET WIFI: CMD%u timed out (status 0x%x present 0x%x)\n",
++				    idx, st, h_rd(H_PRESENT));
++			}
++			h_reset(RST_CMD | RST_DAT);
++			return ETIMEDOUT;
++		}
++	}
++	if (st & INT_ERR) {
++		if (!quiet) {
++			printf("SWEET WIFI: CMD%u error 0x%04x (present 0x%x)\n",
++			    idx, st >> 16, h_rd(H_PRESENT));
++		}
++		h_wr(H_INT, st);
++		h_reset(RST_CMD | RST_DAT);
++		return EIO;
++	}
++	h_wr(H_INT, st);
++	if (resp) {
++		*resp = h_rd(H_RESP0);
++	}
++	return 0;
++}
++
++static int
++h_set_clock(uint32_t hz)
++{
++	uint32_t c = h_rd(H_CLKCTL) & ~0x000fffffu;
++	h_wr(H_CLKCTL, c);
++	uint32_t div = 0;
++	if (wf.base_hz > hz) {
++		div = (wf.base_hz + 2 * hz - 1) / (2 * hz);
++		div = MIN(div, 1023u);
++	}
++	c |= (div & 0xff) << 8 | ((div >> 8) & 3) << 6 | 0xeu << 16 | CLK_INT_EN;
++	h_wr(H_CLKCTL, c);
++	if (h_wait(H_CLKCTL, CLK_INT_STABLE, CLK_INT_STABLE, 100)) {
++		printf("SWEET WIFI: clock did not stabilise\n");
++		return ETIMEDOUT;
++	}
++	h_wr(H_CLKCTL, h_rd(H_CLKCTL) | CLK_CARD_EN);
++	delay(2000);
++	printf("SWEET WIFI: SDIO clock %u kHz\n",
++	    div ? wf.base_hz / (2 * div) / 1000 : wf.base_hz / 1000);
++	return 0;
++}
++
++/* CMD52: one byte of function fn at addr. */
++static int
++cmd52(bool write, uint32_t fn, uint32_t addr, uint8_t in, uint8_t *out)
++{
++	uint32_t arg = (write ? 1u << 31 : 0) | (fn & 7) << 28 | (addr & 0x1ffff) << 9 | in;
++	uint32_t r = 0;
++	int error = h_cmd(52, arg, R_R1, &r, false);
++	if (error) {
++		return error;
++	}
++	if (r & 0xcb00) {       /* R5 flags: COM_CRC, ILLEGAL, ERROR, FUNC_NUM, OUT_OF_RANGE */
++		printf("SWEET WIFI: CMD52 %s f%u 0x%x: R5 flags 0x%02x\n",
++		    write ? "write" : "read", fn, addr, (r >> 8) & 0xff);
++		return EIO;
++	}
++	if (out) {
++		*out = (uint8_t)r;
++	}
++	return 0;
++}
++
++static int
++bp_window(uint32_t addr)
++{
++	int e = cmd52(true, 1, F1_SBADDR_LOW, (addr >> 8) & 0x80, NULL);
++	if (!e) {
++		e = cmd52(true, 1, F1_SBADDR_MID, (addr >> 16) & 0xff, NULL);
++	}
++	if (!e) {
++		e = cmd52(true, 1, F1_SBADDR_HIGH, (addr >> 24) & 0xff, NULL);
++	}
++	return e;
++}
++
++/* 32-bit backplane read through the function 1 window, a byte at a time. */
++static int
++bp_read32(uint32_t addr, uint32_t *v)
++{
++	int e = bp_window(addr);
++	uint32_t off = (addr & 0x7fff) | SB_ACCESS_4B;
++	*v = 0;
++	for (int i = 0; i < 4 && !e; i++) {
++		uint8_t b = 0;
++		e = cmd52(false, 1, off + i, 0, &b);
++		*v |= (uint32_t)b << (8 * i);
++	}
++	return e;
++}
++
++static void
++pins_setup(void)
++{
++	/* Mux words for pins 24..31 (+0x0c) and 32..39 (+0x10). */
++	uint32_t m3 = p_rd(0x0c), m4 = p_rd(0x10);
++	printf("SWEET WIFI: pinctrl mux[24..31] 0x%08x mux[32..39] 0x%08x; regs", m3, m4);
++	for (uint32_t o = 0; o < 0x30; o += 4) {
++		printf(" %08x", p_rd(o));
++	}
++	printf("\n");
++	uint32_t alt = 0;
++	PE_parse_boot_argn("wifimux", &alt, sizeof(alt));
++	if (alt >= 1 && alt <= 8) {
++		for (uint32_t pin = 30; pin <= 35; pin++) {
++			uint32_t off = (pin / 8) * 4, sh = (pin % 8) * 4;
++			uint32_t v = p_rd(off);
++			if (((v >> sh) & 0xf) == 0) {
++				p_wr(off, (v & ~(0xfu << sh)) | alt << sh);
++			}
++		}
++		printf("SWEET WIFI: wifimux=%u -> mux[24..31] 0x%08x mux[32..39] 0x%08x\n",
++		    alt, p_rd(0x0c), p_rd(0x10));
++	}
++	/* WL_ON (GPIO 28) as GPIO: nibble 4 of mux word 3 must be 0. */
++	uint32_t v = p_rd(0x0c);
++	if ((v >> 16) & 0xf) {
++		printf("SWEET WIFI: GPIO 28 was on function %u, setting GPIO\n", (v >> 16) & 0xf);
++		p_wr(0x0c, v & ~(0xfu << 16));
++	}
++}
++
++static void
++wl_power(void)
++{
++	printf("SWEET WIFI: gio bank0 data 0x%08x iodir 0x%08x\n", g_rd(0x04), g_rd(0x08));
++	g_wr(0x04, g_rd(0x04) & ~(1u << WL_ON_PIN));    /* low first: chip reset */
++	g_wr(0x08, g_rd(0x08) & ~(1u << WL_ON_PIN));    /* output */
++	delay(20000);
++	g_wr(0x04, g_rd(0x04) | (1u << WL_ON_PIN));
++	delay(150000);                                  /* wl-on-reg startup-delay-us */
++	printf("SWEET WIFI: WL_ON high (data 0x%08x iodir 0x%08x)\n", g_rd(0x04), g_rd(0x08));
++}
++
++static int
++sdio_init(void)
++{
++	uint32_t r = 0;
++	int e;
++
++	printf("SWEET WIFI: SDHCI version 0x%x caps 0x%08x present 0x%08x\n",
++	    h_rd(H_VERSION) >> 16, h_rd(H_CAPS), h_rd(H_PRESENT));
++	h_reset(RST_ALL);
++	wf.base_hz = ((h_rd(H_CAPS) >> 8) & 0xff) * 1000000u;
++	if (wf.base_hz == 0) {
++		wf.base_hz = 200000000u;        /* clk-emmc2 */
++	}
++	h_wr(H_HOSTCTL, (h_rd(H_HOSTCTL) & ~0xff00u) | (0x7u << 9) | (1u << 8)); /* 3.3 V, bus power */
++	delay(10000);
++	h_wr(H_INT_EN, 0xffffffff);     /* status latches; no interrupt signals */
++	h_wr(H_SIG_EN, 0);
++	if ((e = h_set_clock(400000))) {
++		return e;
++	}
++	h_cmd(0, 0, R_NONE, NULL, true);
++	delay(2000);
++	/* CMD5 with arg 0 asks for the OCR; then repeat with 3.2-3.4 V until ready. */
++	if ((e = h_cmd(5, 0, R_R3, &r, false))) {
++		printf("SWEET WIFI: no answer to CMD5 (pins not muxed? try boot-arg wifimux=N)\n");
++		return e;
++	}
++	printf("SWEET WIFI: CMD5 OCR 0x%08x (%u function(s))\n", r, (r >> 28) & 7);
++	for (int i = 0; i < 100; i++) {
++		if ((e = h_cmd(5, 0x00300000, R_R3, &r, false))) {
++			return e;
++		}
++		if (r & (1u << 31)) {
++			break;
++		}
++		delay(10000);
++	}
++	if (!(r & (1u << 31))) {
++		printf("SWEET WIFI: card never ready (OCR 0x%08x)\n", r);
++		return ETIMEDOUT;
++	}
++	if ((e = h_cmd(3, 0, R_R1, &r, false))) {
++		return e;
++	}
++	wf.rca = r >> 16;
++	if ((e = h_cmd(7, wf.rca << 16, R_R1B, NULL, false))) {
++		return e;
++	}
++	uint8_t rev = 0, caps = 0;
++	cmd52(false, 0, CCCR_REV, 0, &rev);
++	cmd52(false, 0, CCCR_CAPS, 0, &caps);
++	printf("SWEET WIFI: SDIO card rca 0x%x, CCCR rev 0x%02x caps 0x%02x\n", wf.rca, rev, caps);
++	/* 4-bit bus, 25 MHz. */
++	uint8_t bus = 0;
++	if (!cmd52(false, 0, CCCR_BUSIF, 0, &bus) &&
++	    !cmd52(true, 0, CCCR_BUSIF, (bus & ~3) | 2, NULL)) {
++		h_wr(H_HOSTCTL, h_rd(H_HOSTCTL) | HC1_4BIT);
++	}
++	h_set_clock(25000000);
++	/* Enable function 1 (the backplane) and wait for it. */
++	if ((e = cmd52(true, 0, CCCR_IOEN, 0x02, NULL))) {
++		return e;
++	}
++	uint8_t rdy = 0;
++	for (int i = 0; i < 100 && !(rdy & 0x02); i++) {
++		cmd52(false, 0, CCCR_IORDY, 0, &rdy);
++		delay(10000);
++	}
++	printf("SWEET WIFI: function 1 %s (IORDY 0x%02x)\n", (rdy & 2) ? "ready" : "NOT ready", rdy);
++	return (rdy & 2) ? 0 : ETIMEDOUT;
++}
++
++static int
++chip_id(void)
++{
++	int e = cmd52(true, 1, F1_CHIPCLKCSR, CLK_HW_REQ_OFF | CLK_ALP_REQ, NULL);
++	uint8_t csr = 0;
++	for (int i = 0; i < 100 && !e; i++) {
++		e = cmd52(false, 1, F1_CHIPCLKCSR, 0, &csr);
++		if (csr & CLK_ALP_AVAIL) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("SWEET WIFI: ALP clock %s (csr 0x%02x)\n", (csr & CLK_ALP_AVAIL) ? "up" : "NOT up", csr);
++	uint32_t id = 0;
++	if (e || (e = bp_read32(CHIPCOMMON, &id))) {
++		printf("SWEET WIFI: chip ID read failed (%d)\n", e);
++		return e;
++	}
++	printf("SWEET WIFI: chip 0x%04x rev %u (raw 0x%08x)%s\n", id & 0xffff, (id >> 16) & 0xf, id,
++	    (id & 0xffff) == 0x4345 ? " = CYW43455" : "");
++	return 0;
++}
++
++static void
++sweet_wifi_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	pins_setup();
++	wl_power();
++	if (sdio_init() == 0) {
++		chip_id();
++	}
++	/* Returning from the continuation terminates the thread. */
++}
++
++void sweet_wifi_start(void);
++
++void
++sweet_wifi_start(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("wifi", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET WIFI: disabled (wifi=0)\n");
++		return;
++	}
++	wf.regs = ml_io_map(WF_HOST_PA, 0x1000);
++	wf.cfg = wf.regs + 0x400;
++	wf.gio = ml_io_map(GIO_PA & ~0xfffull, 0x1000) + (GIO_PA & 0xfff);
++	wf.pinctrl = ml_io_map(PINCTRL_PA & ~0xfffull, 0x1000) + (PINCTRL_PA & 0xfff);
++	if (!wf.regs || !wf.gio || !wf.pinctrl) {
++		printf("SWEET WIFI: cannot map registers\n");
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(sweet_wifi_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif
 diff --git a/bsd/dev/sweet_xhci.c b/bsd/dev/sweet_xhci.c
 new file mode 100644
 index 0000000..9274c50
