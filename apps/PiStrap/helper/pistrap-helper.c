@@ -131,7 +131,11 @@ jb_path(const char *p, char *out, size_t n)
 	if (strncmp(p, "var/jb", 6) != 0 || (p[6] != '/' && p[6] != '\0') || strstr(p, "..")) {
 		return NULL;
 	}
-	snprintf(out, n, "/%s", p);
+	/*
+	 * /var is a symlink to /private/var, and ARCHIVE_EXTRACT_SECURE_SYMLINKS
+	 * refuses to extract through it: the first run left /var/jb empty.
+	 */
+	snprintf(out, n, "/private/%s", p);
 	return out;
 }
 

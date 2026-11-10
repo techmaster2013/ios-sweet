@@ -543,3 +543,11 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
 - PiStrap ran on the Pi (exec pistrap-helper x3, then SpringBoard restarted
   at 229 s); result not checked yet.
 - Smoother screen at sweetfb_hz=30 confirmed by the user.
+- PiStrap first run left /var/jb empty: /var is a symlink to /private/var and
+  ARCHIVE_EXTRACT_SECURE_SYMLINKS refused every entry. Helper now extracts to
+  /private/var/jb (v13 delta, 474 blocks, on the card).
+- Card for 2026-11-10: kernel 74629ee (CPU probe open/masked at boot, 30 s,
+  120 s; Wi-Fi opt-in STEP logging) with wifi=1 sweetfb_hz=30 xhciscroll=24.
+  Fallback on the card: payload-185e70f-nowifi.bin (rename to payload.bin).
+- Next card reads: try scratchpad sd-attach-wsl.ps1 (wsl --mount --bare)
+  instead of copying the whole 16 GiB partition.
