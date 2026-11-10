@@ -123,7 +123,7 @@ jobs:
           # Content-changed files only; unchanged ones keep their cached mtimes.
           # No -t (so not -a): rsync -a also stamps the source's fresh mtime on
           # files it does not copy, which made make rebuild everything.
-          rsync -rlpD --checksum --delete --omit-dir-times --exclude .git xnu/ xnu.cached/
+          rsync -rlpD --checksum --delete --exclude .git xnu/ xnu.cached/
           rm -rf xnu
           mv xnu.cached xnu
           echo "incremental: synced the freshly patched tree into the cached one"
