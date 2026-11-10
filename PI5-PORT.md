@@ -529,3 +529,17 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   Hardware row, PiStrap with the setuid-root helper + bundled packages
   (~29 MB), AssistiveTouch on (com.apple.Accessibility AssistiveTouchEnabled).
 - If the CPU clock log is low: config.txt force_turbo=1 (firmware still throttles).
+
+### 2026-11-09 late: CPU runs ~40x slow
+
+- Kernel 185e70f (wifi=0) boot: `SWEET: cpu clock ~57 MHz (10M dependent adds
+  in 173011 us)` at platform-expert start (1.8 s). A76 should do that in
+  ~4-7 ms. SCTLR (C/I/M), HCR_EL2 (RW only) and MAIR look normal in start.s.
+  Candidates: interrupt storm (timer PPI group oddity in the log) vs clock /
+  cache state. Kernel 74629ee (CI 42738693649) probes with IRQ/FIQ open and
+  masked, at boot and 30/120 s after root.
+- Wi-Fi driver panics within ~2 s of root (before the first SD log flush).
+  Kernel 2e79611 makes it opt-in (wifi=1) with STEP logging + 3 s sleeps.
+- PiStrap ran on the Pi (exec pistrap-helper x3, then SpringBoard restarted
+  at 229 s); result not checked yet.
+- Smoother screen at sweetfb_hz=30 confirmed by the user.
