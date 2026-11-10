@@ -948,10 +948,10 @@ index 6b926fe..7ed5036 100644
  
 diff --git a/bsd/dev/sweet_wifi.c b/bsd/dev/sweet_wifi.c
 new file mode 100644
-index 0000000..1755700
+index 0000000..4bafb4d
 --- /dev/null
 +++ b/bsd/dev/sweet_wifi.c
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,436 @@
 +/*
 + * SWEET (Raspberry Pi 5) Wi-Fi, step 1: bring up the CYW43455 over SDIO and
 + * read its chip ID. No network yet.
@@ -967,7 +967,11 @@ index 0000000..1755700
 + *    wifimux=N (1..8) writes alt function N for pins 30..35 if they are on
 + *    function 0 (GPIO). Without a working mux CMD5 simply times out.
 + *
-+ * Polled PIO, CMD52 (single byte) only; boot-arg wifi=0 skips the driver.
++ * Polled PIO, CMD52 (single byte) only. Off unless boot-arg wifi=1: the
++ * first version panicked the Pi within seconds of the root mount, before the
++ * SD log was saved. So the thread waits 15 s, and before each first touch of
++ * a register block it logs a STEP line and sleeps 3 s (the SD log is saved
++ * every 2 s): the last STEP in the log names the access that kills it.
 + * Output: "SWEET WIFI: chip 0x4345 rev N" when the chip answers.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
@@ -978,6 +982,9 @@ index 0000000..1755700
 +#include <kern/sched_prim.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
++#include <sys/proc.h>
++
++extern int hz;
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
@@ -1042,6 +1049,15 @@ index 0000000..1755700
 +	uint32_t base_hz;
 +	uint32_t rca;
 +} wf;
++
++static int wf_chan;
++
++static void
++step(const char *what)
++{
++	printf("SWEET WIFI: STEP %s\n", what);
++	(void)tsleep(&wf_chan, PZERO, "wifistep", hz * 3);
++}
 +
 +static inline uint32_t h_rd(uint32_t o) { return *(volatile uint32_t *)(wf.regs + o); }
 +static inline void h_wr(uint32_t o, uint32_t v) { *(volatile uint32_t *)(wf.regs + o) = v; }
@@ -1193,6 +1209,7 @@ index 0000000..1755700
 +pins_setup(void)
 +{
 +	/* Mux words for pins 24..31 (+0x0c) and 32..39 (+0x10). */
++	step("read pinctrl @0x107d504100");
 +	uint32_t m3 = p_rd(0x0c), m4 = p_rd(0x10);
 +	printf("SWEET WIFI: pinctrl mux[24..31] 0x%08x mux[32..39] 0x%08x; regs", m3, m4);
 +	for (uint32_t o = 0; o < 0x30; o += 4) {
@@ -1215,6 +1232,7 @@ index 0000000..1755700
 +	/* WL_ON (GPIO 28) as GPIO: nibble 4 of mux word 3 must be 0. */
 +	uint32_t v = p_rd(0x0c);
 +	if ((v >> 16) & 0xf) {
++		step("write pinctrl mux for GPIO 28");
 +		printf("SWEET WIFI: GPIO 28 was on function %u, setting GPIO\n", (v >> 16) & 0xf);
 +		p_wr(0x0c, v & ~(0xfu << 16));
 +	}
@@ -1223,7 +1241,9 @@ index 0000000..1755700
 +static void
 +wl_power(void)
 +{
++	step("read gio @0x107d508500");
 +	printf("SWEET WIFI: gio bank0 data 0x%08x iodir 0x%08x\n", g_rd(0x04), g_rd(0x08));
++	step("drive WL_ON (GPIO 28) low, then high");
 +	g_wr(0x04, g_rd(0x04) & ~(1u << WL_ON_PIN));    /* low first: chip reset */
 +	g_wr(0x08, g_rd(0x08) & ~(1u << WL_ON_PIN));    /* output */
 +	delay(20000);
@@ -1238,8 +1258,10 @@ index 0000000..1755700
 +	uint32_t r = 0;
 +	int e;
 +
++	step("read SDIO host @0x1001100000");
 +	printf("SWEET WIFI: SDHCI version 0x%x caps 0x%08x present 0x%08x\n",
 +	    h_rd(H_VERSION) >> 16, h_rd(H_CAPS), h_rd(H_PRESENT));
++	step("SDIO host reset");
 +	h_reset(RST_ALL);
 +	wf.base_hz = ((h_rd(H_CAPS) >> 8) & 0xff) * 1000000u;
 +	if (wf.base_hz == 0) {
@@ -1330,6 +1352,17 @@ index 0000000..1755700
 +static void
 +sweet_wifi_thread(__unused void *arg, __unused wait_result_t wr)
 +{
++	printf("SWEET WIFI: starting in 15 s\n");
++	(void)tsleep(&wf_chan, PZERO, "wifiwait", hz * 15);
++	step("map registers (host, gio, pinctrl)");
++	wf.regs = ml_io_map(WF_HOST_PA, 0x1000);
++	wf.cfg = wf.regs + 0x400;
++	wf.gio = ml_io_map(GIO_PA & ~0xfffull, 0x1000) + (GIO_PA & 0xfff);
++	wf.pinctrl = ml_io_map(PINCTRL_PA & ~0xfffull, 0x1000) + (PINCTRL_PA & 0xfff);
++	if (!wf.regs || !wf.gio || !wf.pinctrl) {
++		printf("SWEET WIFI: cannot map registers\n");
++		return;
++	}
 +	pins_setup();
 +	wl_power();
 +	if (sdio_init() == 0) {
@@ -1343,18 +1376,10 @@ index 0000000..1755700
 +void
 +sweet_wifi_start(void)
 +{
-+	uint32_t on = 1;
++	uint32_t on = 0;
 +	PE_parse_boot_argn("wifi", &on, sizeof(on));
 +	if (!on) {
-+		printf("SWEET WIFI: disabled (wifi=0)\n");
-+		return;
-+	}
-+	wf.regs = ml_io_map(WF_HOST_PA, 0x1000);
-+	wf.cfg = wf.regs + 0x400;
-+	wf.gio = ml_io_map(GIO_PA & ~0xfffull, 0x1000) + (GIO_PA & 0xfff);
-+	wf.pinctrl = ml_io_map(PINCTRL_PA & ~0xfffull, 0x1000) + (PINCTRL_PA & 0xfff);
-+	if (!wf.regs || !wf.gio || !wf.pinctrl) {
-+		printf("SWEET WIFI: cannot map registers\n");
++		printf("SWEET WIFI: off (boot-arg wifi=1 to try it)\n");
 +		return;
 +	}
 +	thread_t t;
