@@ -14,10 +14,10 @@ index 6630131..8314347 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
 new file mode 100644
-index 0000000..8b983d9
+index 0000000..8df7da2
 --- /dev/null
 +++ b/bsd/dev/sweet_sd.c
-@@ -0,0 +1,882 @@
+@@ -0,0 +1,893 @@
 +/*
 + * SWEET (Raspberry Pi 5) SD card root device.
 + *
@@ -67,6 +67,7 @@ index 0000000..8b983d9
 +extern void sweet_xhci_start(void);
 +#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
 +extern void sweet_wifi_start(void);
++extern void sweet_cpu_probe(const char *when);
 +#endif
 +
 +/* SDHCI registers, all accessed as aligned 32-bit words. */
@@ -806,8 +807,18 @@ index 0000000..8b983d9
 +
 +	printf("SWEET SD LOG: console log to partition at block %llu every %u s\n",
 +	    sd.log_first, sdlog_secs);
++	uint32_t ticks = 0;
 +	for (;;) {
 +		(void)tsleep(&sdlog_chan, PZERO, "sdlog", hz * (int)sdlog_secs);
++#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++		/* CPU speed again once userland is busy (see SweetPlatformExpert.cpp). */
++		ticks++;
++		if (ticks * sdlog_secs == 30) {
++			sweet_cpu_probe("30 s after root");
++		} else if (ticks * sdlog_secs == 120) {
++			sweet_cpu_probe("120 s after root");
++		}
++#endif
 +		uint64_t total = sweet_log_position();
 +		if (total == flushed) {
 +			continue;
@@ -3359,10 +3370,10 @@ index 0000000..723ca7c
 +	}
 +}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..6eaf5db 100644
+index 0631685..1547134 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -18,6 +18,7 @@ public:
+@@ -18,14 +18,62 @@ public:
  	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
  	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
  	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
@@ -3370,40 +3381,62 @@ index 0631685..6eaf5db 100644
  };
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
-@@ -26,6 +27,32 @@ bool
+ 
++#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++/*
++ * CPU speed probe. Not via the PMU: touching PMCR_EL0 panicked the Pi at
++ * boot (trapped by the firmware). A chain of 10M dependent adds runs at
++ * 1 add/cycle on Cortex-A76; timed with the generic timer. The first run
++ * measured ~57 MHz (should be 1500-2400), so it runs twice: with IRQ/FIQ
++ * open and masked. Fast when masked = interrupt storm; slow both ways =
++ * clock or cache state. Also callable later (sweet_cpu_probe from C).
++ */
++static uint64_t
++sweet_adds_us(bool masked)
++{
++	uint64_t t0, t1, frq, daif, x = 0, n = 10000000;
++	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(frq));
++	__asm__ volatile ("mrs %0, DAIF" : "=r"(daif));
++	if (masked) {
++		__asm__ volatile ("msr DAIFSet, #3" ::: "memory");
++	}
++	__asm__ volatile ("isb; mrs %0, CNTVCT_EL0" : "=r"(t0));
++	__asm__ volatile (
++		"1: add %0, %0, #1\n"
++		"   add %0, %0, #1\n"
++		"   add %0, %0, #1\n"
++		"   add %0, %0, #1\n"
++		"   subs %1, %1, #4\n"
++		"   b.ne 1b\n"
++		: "+r"(x), "+r"(n) : : "cc");
++	__asm__ volatile ("isb; mrs %0, CNTVCT_EL0" : "=r"(t1));
++	__asm__ volatile ("msr DAIF, %0" : : "r"(daif) : "memory");
++	return (t1 > t0 && frq) ? (t1 - t0) * 1000000ULL / frq : 0;
++}
++
++extern "C" void sweet_cpu_probe(const char *when);
++
++extern "C" void
++sweet_cpu_probe(const char *when)
++{
++	uint64_t open = sweet_adds_us(false), masked = sweet_adds_us(true);
++	IOLog("SWEET: cpu speed (%s): 10M dependent adds %llu us with interrupts (~%llu MHz), "
++	    "%llu us masked (~%llu MHz)\n", when,
++	    open, open ? 10000000ULL / open : 0, masked, masked ? 10000000ULL / masked : 0);
++}
++#endif
++
+ bool
  SweetPlatformExpert::start(IOService *provider)
  {
  	IOLog("SWEET: starting device-tree platform expert\n");
 +#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
-+	{
-+		/*
-+		 * CPU clock as the firmware left it. Not via the PMU: touching
-+		 * PMCR_EL0 panicked the Pi at boot (trapped by the firmware). A
-+		 * chain of 10M dependent adds runs at 1 add/cycle on Cortex-A76;
-+		 * time it with the generic timer (CNTFRQ 54 MHz).
-+		 */
-+		uint64_t t0, t1, frq, x = 0, n = 10000000;
-+		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(frq));
-+		__asm__ volatile ("isb; mrs %0, CNTVCT_EL0" : "=r"(t0));
-+		__asm__ volatile (
-+			"1: add %0, %0, #1\n"
-+			"   add %0, %0, #1\n"
-+			"   add %0, %0, #1\n"
-+			"   add %0, %0, #1\n"
-+			"   subs %1, %1, #4\n"
-+			"   b.ne 1b\n"
-+			: "+r"(x), "+r"(n) : : "cc");
-+		__asm__ volatile ("isb; mrs %0, CNTVCT_EL0" : "=r"(t1));
-+		if (t1 > t0 && frq) {
-+			IOLog("SWEET: cpu clock ~%llu MHz (10M dependent adds in %llu us)\n",
-+			    10000000ULL * frq / (t1 - t0) / 1000000ULL, (t1 - t0) * 1000000ULL / frq);
-+		}
-+	}
++	sweet_cpu_probe("platform expert start");
 +#endif
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}
-@@ -74,6 +101,39 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+@@ -74,6 +122,39 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
  	}
  }
  
