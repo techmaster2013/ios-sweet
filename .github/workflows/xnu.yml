@@ -152,40 +152,6 @@ jobs:
             !dxb/build.sh
           key: xnu-${{ inputs.runner || 'macos-15-intel' }}-${{ env.BOARD }}-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.DXB_SHA }}-${{ github.run_id }}
 
-      - name: Package build tree for local compiles
-        if: always()
-        run: |
-          # Generated headers, config option headers, mig output and the patched
-          # source: enough to re-run any single compile command from the log locally.
-          SDK=$(xcrun --sdk macosx --show-sdk-path)
-          mkdir -p sdk-kernel-platform
-          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
-          tar czf buildtree.tgz \
-            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
-            --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
-            -C .. sdk-kernel-platform
-          ls -la buildtree.tgz
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: xnu-buildtree
-          path: buildtree.tgz
-          retention-days: 7
-
-      - name: Inspect closed KDK support libs
-        if: always()
-        run: |
-          mkdir -p out/kdk-libs
-          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
-            b=$(basename "$lib" .a)
-            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
-            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
-            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
-          done
-          ls -la out/kdk-libs
-
       - name: Collect
         if: always()
         run: |
