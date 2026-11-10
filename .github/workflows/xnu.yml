@@ -138,8 +138,11 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
+      # Only full builds save (an upload of the whole tree): incremental builds
+      # reuse that base and recompile everything changed since it. Run once with
+      # clean=true to refresh the base when incremental builds get slow.
       - name: Save incremental cache
-        if: success()
+        if: success() && steps.cache.outputs.cache-matched-key == ''
         uses: actions/cache/save@v4
         with:
           path: |
