@@ -17,10 +17,13 @@ on:
         default: "true"
       board:
         description: sweet (Redmi Note 10 Pro) or pi5 (Raspberry Pi 5, adds -DSWEET_BOARD_PI5=1)
-        default: sweet
+        default: pi5
       runner:
-        description: macOS runner image (macos-14 was retired between 2026-10-18 and 2026-11-07)
-        default: macos-15
+        description: macOS runner image (macos-15 arm64 often sits in a capacity queue; macos-15-intel starts at once)
+        default: macos-15-intel
+      clean:
+        description: ignore the incremental build cache (full ~20 min build)
+        default: "false"
   push:
     branches: [main]
     paths:
@@ -37,14 +40,14 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
-  BOARD: ${{ inputs.board || 'sweet' }}
+  BOARD: ${{ inputs.board || 'pi5' }}
 
 jobs:
   build:
     # Needs an Xcode 15.x iig: it matches the xnu-8796 IORPC ABI (Xcode 16's
     # iig emits IORPC.kernelContent, which this xnu lacks). macos-14 had it but
     # is no longer offered; "Deps" below picks the OLDEST Xcode on the image.
-    runs-on: ${{ inputs.runner || 'macos-15' }}
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +72,50 @@ jobs:
             echo "unknown board $BOARD" >&2; exit 1
           fi
           ls dxb/patches
+          # Incremental builds: after build.sh patches a fresh xnu checkout, a
+          # hook syncs only content-changed files into the cached tree (see
+          # "Incremental cache"), so make recompiles just those.
+          perl -pi -e 's/^    patches$/    patches\n    [ -n "\$\{POST_PATCH_HOOK:-}" ] && bash "\$\{POST_PATCH_HOOK}"/' dxb/build.sh
+          grep -n -A1 '^    patches$' dxb/build.sh
+          grep -c 'bash "${POST_PATCH_HOOK}"' dxb/build.sh
+
+      # Everything build.sh produces, keyed per runner type, board and build
+      # script; restore-keys pick the newest entry for the same combination.
+      - name: Restore incremental cache
+        id: cache
+        if: inputs.clean != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dxb/*
+            !dxb/.git
+            !dxb/patches
+            !dxb/build.sh
+          key: xnu-${{ inputs.runner || 'macos-15-intel' }}-${{ env.BOARD }}-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.DXB_SHA }}-${{ github.run_id }}
+          restore-keys: |
+            xnu-${{ inputs.runner || 'macos-15-intel' }}-${{ env.BOARD }}-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.DXB_SHA }}-
+
+      - name: Incremental cache
+        if: steps.cache.outputs.cache-matched-key != ''
+        run: |
+          # build.sh clones xnu only when dxb/xnu is missing: give it a clean
+          # local clone of the cached repo (no network), patched from scratch.
+          mv dxb/xnu dxb/xnu.cached
+          git clone -q --no-checkout dxb/xnu.cached dxb/xnu
+          git -C dxb/xnu checkout -q "$(git -C dxb/xnu.cached rev-parse HEAD)"
+          # The kernel's presence makes build.sh skip make: remove it.
+          rm -f dxb/build/xnu.obj/kernel.* || true
+          cat > "$RUNNER_TEMP/post-patch.sh" <<'EOF'
+          set -e
+          cd "$GITHUB_WORKSPACE/dxb"
+          # Content-changed files only; unchanged ones keep their cached mtimes.
+          rsync -a --checksum --delete --exclude .git xnu/ xnu.cached/
+          rm -rf xnu
+          mv xnu.cached xnu
+          echo "incremental: synced the freshly patched tree into the cached one"
+          EOF
+          echo "POST_PATCH_HOOK=$RUNNER_TEMP/post-patch.sh" >> "$GITHUB_ENV"
+          echo "restored ${{ steps.cache.outputs.cache-matched-key }}"
 
       - name: Deps
         run: |
@@ -90,6 +137,17 @@ jobs:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
+
+      - name: Save incremental cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dxb/*
+            !dxb/.git
+            !dxb/patches
+            !dxb/build.sh
+          key: xnu-${{ inputs.runner || 'macos-15-intel' }}-${{ env.BOARD }}-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.DXB_SHA }}-${{ github.run_id }}
 
       - name: Package build tree for local compiles
         if: always()
