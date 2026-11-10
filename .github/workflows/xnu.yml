@@ -79,6 +79,18 @@ jobs:
           grep -n -A1 '^    patches$' dxb/build.sh
           grep -c 'bash "${POST_PATCH_HOOK}"' dxb/build.sh
 
+      # The installed KDK (build.sh downloads and installs it into
+      # /Library/Developer/KDKs whenever it is missing: ~2 min per run).
+      - name: Make the KDK folder cacheable
+        run: |
+          sudo mkdir -p /Library/Developer/KDKs
+          sudo chown -R "$(id -un)" /Library/Developer/KDKs
+      - name: KDK cache
+        uses: actions/cache@v4
+        with:
+          path: /Library/Developer/KDKs
+          key: kdk-${{ inputs.runner || 'macos-15-intel' }}-${{ env.MACOS_VERSION }}-${{ env.DXB_SHA }}
+
       # Everything build.sh produces, keyed per runner type, board and build
       # script; restore-keys pick the newest entry for the same combination.
       - name: Restore incremental cache
@@ -109,7 +121,9 @@ jobs:
           set -e
           cd "$GITHUB_WORKSPACE/dxb"
           # Content-changed files only; unchanged ones keep their cached mtimes.
-          rsync -a --checksum --delete --exclude .git xnu/ xnu.cached/
+          # No -t (so not -a): rsync -a also stamps the source's fresh mtime on
+          # files it does not copy, which made make rebuild everything.
+          rsync -rlpD --checksum --delete --omit-dir-times --exclude .git xnu/ xnu.cached/
           rm -rf xnu
           mv xnu.cached xnu
           echo "incremental: synced the freshly patched tree into the cached one"
