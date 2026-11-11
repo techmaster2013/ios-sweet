@@ -1,0 +1,44 @@
+name: trollstorelite
+
+# Builds TrollStore Lite (opa334/TrollStore, MIT) as a rootless .deb for
+# PiStrap to bundle: the package is not on GitHub releases, so we build it.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: opa334/TrollStore git ref
+        default: main
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Tools
+        run: |
+          brew install ldid libarchive dpkg make
+          git clone -q --depth 1 --recursive https://github.com/theos/theos "$HOME/theos"
+          # TrollStoreLite/Makefile targets iphone:clang:16.5
+          git clone -q --depth 1 https://github.com/theos/sdks "$RUNNER_TEMP/sdks"
+          ls "$RUNNER_TEMP/sdks" | grep -i iphoneos | tail -5
+          cp -R "$RUNNER_TEMP/sdks/iPhoneOS16.5.sdk" "$HOME/theos/sdks/"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Source
+        run: |
+          git clone -q --depth 1 --branch "${{ inputs.ref || 'main' }}" https://github.com/opa334/TrollStore ts
+          git -C ts log -1 --format='%H %s'
+
+      - name: Build rootless package
+        working-directory: ts/TrollStoreLite
+        run: |
+          gmake package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          ls -la packages
+          for d in packages/*.deb; do dpkg-deb -f "$d"; dpkg-deb -c "$d" | head -20; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trollstorelite-deb
+          path: |
+            ts/TrollStoreLite/packages/*.deb
+            ts/LICENSE
