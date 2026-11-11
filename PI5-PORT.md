@@ -567,3 +567,17 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
 - CI: actions/cache of the build.sh work dir + rsync (no -t) of the freshly
   patched tree = incremental make; KDK install cached; build-tree artifact
   dropped. clean=true for a full rebuild.
+
+### 2026-11-11: CPU is fine; Wi-Fi pins via firmware
+
+- CPU probe (mach_absolute_time): 10M dependent adds in 4.17 ms = ~2400 MHz,
+  same with IRQs masked. The 57 MHz figure was a broken raw-CNTVCT read.
+- Kernel 1b23eb3: reading pinctrl +0x00 (0x107d504100) panics -> the kernel
+  cannot mux pins. Kernel 868bc46 (CI 43022260656) leaves pinctrl alone and
+  logs the BCM2712 stepping the shim now copies from the firmware DT
+  (ADT /sweet-wifi soc-rev). sd2 alt (Linux pinctrl-bcm2712.c): D0 = 1 on
+  pins 30..35; C0 = 4,4,4,3,4,3.
+- Card: shim with stepping detection (old one kept as kernel8-shim-old.img),
+  868bc46 payload (wifi=1 sweetfb_hz=60 xhciscroll=24), config.txt
+  `gpio=30-35=a1` + `gpio=31-35=pu` (board bought Aug 2026: D0 expected;
+  config backup config-before-wifi.txt). Unknown: whether firmware aN = mux N.
