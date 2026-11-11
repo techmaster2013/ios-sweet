@@ -55,6 +55,10 @@ final class Strapper: ObservableObject {
         if options.sileo { s.append(PackageSpec(title: "Sileo", prefixes: ["org.coolstar.sileo", "sileo"])) }
         if options.zebra { s.append(PackageSpec(title: "Zebra", prefixes: ["xyz.willy.zebra", "zebra"])) }
         if options.trollStoreLite {
+            // TrollStore Lite depends on ldid, which the Procursus bootstrap
+            // lacks (and ldid on libplist3): install them in the same dpkg run.
+            s.append(PackageSpec(title: "libplist3", prefixes: ["libplist3_"]))
+            s.append(PackageSpec(title: "ldid", prefixes: ["ldid_"]))
             s.append(PackageSpec(title: "TrollStore Lite", prefixes: ["com.opa334.trollstorelite", "trollstorelite", "trollstore-lite"]))
         }
         return s
