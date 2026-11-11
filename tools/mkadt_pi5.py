@@ -81,7 +81,10 @@ def build(qemu=False, seed=None):
         ('system-firmware-version', cstr('pi5-shim')),
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
         ('crypto-hash-method', cstr('sha2-384')),
-        ('display-scale', u32(2)),
+        # Retina scale. 2 on a 1920x1080 framebuffer = 960x540 points; 1 with
+        # a 1280x720 framebuffer (config.txt) = 2.25x fewer pixels to draw on
+        # the CPU, scaled up to the monitor by the Pi's display hardware.
+        ('display-scale', u32(int(os.environ.get('SWEET_SCALE', '2')))),
         ('unique-chip-id', struct.pack('<Q', PI5_ECID)),
         ('chip-id', u32(0x8010)),     # A10, the iPad (6th generation) SoC
         ('certificate-production-status', u32(0)),
