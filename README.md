@@ -145,7 +145,7 @@ python3 tools/sweet-log.py log-area.bin boot.txt
 | `sdhs=0`, `sdclk=HZ` | Stay at default speed (25 MHz) instead of High Speed; cap the SD clock |
 | `xhci=0` | Disable the USB driver |
 | `xhcidebug=1` | Log every USB report and interface |
-| `sweetfb_hz=N` | How often the frame is copied to the HDMI screen (default 10; the payload now uses 30) |
+| `sweetfb_hz=N` | How often the frame is copied to the HDMI screen (default 10; 30 confirmed smoother on the Pi, 60 being tried) |
 | `xhciscroll=N` | Scale (negative: invert) the mouse wheel (payload default now 24; 8 was still too slow) |
 | `sweethidtest=N` | Press Home every N seconds (input-free testing) |
 

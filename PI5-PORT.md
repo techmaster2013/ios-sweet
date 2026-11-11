@@ -551,3 +551,19 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   Fallback on the card: payload-185e70f-nowifi.bin (rename to payload.bin).
 - Next card reads: try scratchpad sd-attach-wsl.ps1 (wsl --mount --bare)
   instead of copying the whole 16 GiB partition.
+
+### 2026-11-10: Wi-Fi gets to CMD5, CI ~6.5 min
+
+- Kernel 5097e53 boot (pinctrl skipped): WL_ON (GPIO 28) works, the SDIO host
+  reads fine (SDHCI 0x1002, caps 0x55eec832), CMD5 -> end-bit error with
+  PRESENT 0x000f0000 (CMD/DAT low): pins 30..35 not muxed by the firmware.
+  The earlier pinctrl panic is most likely the read loop past 0x20 (the
+  bcm2712d0 pinctrl block is 0x20 long; c0 0x30).
+- Kernel 1b23eb3 (CI 42937956002, incremental: 6.5 min total): pinctrl reads
+  inside 0x20 only, then tries sd2 alt 1..8 on pins 30..35 until CMD5 answers;
+  CPU probe timed with mach_absolute_time (raw CNTVCT reads were garbage, so
+  the earlier ~57 MHz figure is not trustworthy).
+- On the card: 1b23eb3 with wifi=1 sweetfb_hz=60 xhciscroll=24.
+- CI: actions/cache of the build.sh work dir + rsync (no -t) of the freshly
+  patched tree = incremental make; KDK install cached; build-tree artifact
+  dropped. clean=true for a full rebuild.
