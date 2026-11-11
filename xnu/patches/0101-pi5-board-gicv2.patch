@@ -959,10 +959,10 @@ index 6b926fe..7ed5036 100644
  
 diff --git a/bsd/dev/sweet_wifi.c b/bsd/dev/sweet_wifi.c
 new file mode 100644
-index 0000000..51ea98f
+index 0000000..351fbcf
 --- /dev/null
 +++ b/bsd/dev/sweet_wifi.c
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,492 @@
 +/*
 + * SWEET (Raspberry Pi 5) Wi-Fi, step 1: bring up the CYW43455 over SDIO and
 + * read its chip ID. No network yet.
@@ -1216,17 +1216,22 @@ index 0000000..51ea98f
 +	return e;
 +}
 +
++static bool wf_pins_ok;         /* pinctrl reads worked */
++
 +static void
 +pins_setup(void)
 +{
-+	/* Mux words for pins 24..31 (+0x0c) and 32..39 (+0x10). */
-+	step("read pinctrl @0x107d504100");
-+	uint32_t m3 = p_rd(0x0c), m4 = p_rd(0x10);
-+	printf("SWEET WIFI: pinctrl mux[24..31] 0x%08x mux[32..39] 0x%08x; regs", m3, m4);
-+	for (uint32_t o = 0; o < 0x30; o += 4) {
-+		printf(" %08x", p_rd(o));
++	/*
++	 * Mux words for pins 24..31 (+0x0c) and 32..39 (+0x10). Only the first
++	 * 0x20 bytes: the BCM2712 D0 pinctrl is 0x20 long (C0: 0x30), and the
++	 * old loop to 0x2c is the likely cause of the 2026-11-10 panic. One
++	 * line per register so a fault still leaves the earlier ones in the log.
++	 */
++	step("read pinctrl words 0x00..0x1c @0x107d504100");
++	for (uint32_t o = 0; o < 0x20; o += 4) {
++		printf("SWEET WIFI: pinctrl +0x%02x = 0x%08x\n", o, p_rd(o));
 +	}
-+	printf("\n");
++	wf_pins_ok = true;
 +	uint32_t alt = 0;
 +	PE_parse_boot_argn("wifimux", &alt, sizeof(alt));
 +	if (alt >= 1 && alt <= 8) {
@@ -1263,6 +1268,46 @@ index 0000000..51ea98f
 +	printf("SWEET WIFI: WL_ON high (data 0x%08x iodir 0x%08x)\n", g_rd(0x04), g_rd(0x08));
 +}
 +
++/*
++ * The firmware leaves pins 30..35 off the SDIO host (2026-11-10: CMD5 end-bit
++ * error, CMD/DAT lines low in PRESENT). The alt-function number of "sd2" is
++ * not known here, so try 1..8 on those six pins (they only reach the Wi-Fi
++ * chip on a Pi 5) and keep the first one the chip answers CMD5 on.
++ */
++static int
++cmd5_probe(uint32_t *r)
++{
++	if (h_cmd(5, 0, R_R3, r, true) == 0) {
++		printf("SWEET WIFI: CMD5 answered with the firmware's pin setup\n");
++		return 0;
++	}
++	if (!wf_pins_ok) {
++		return EIO;
++	}
++	uint32_t w3 = p_rd(0x0c), w4 = p_rd(0x10);
++	printf("SWEET WIFI: CMD5 failed (present 0x%08x); probing pin functions, mux 0x%08x 0x%08x\n",
++	    h_rd(H_PRESENT), w3, w4);
++	for (uint32_t alt = 1; alt <= 8; alt++) {
++		uint32_t n3 = (w3 & 0x00ffffffu) | alt << 24 | alt << 28;      /* pins 30, 31 */
++		uint32_t n4 = (w4 & 0xffff0000u) | alt | alt << 4 | alt << 8 | alt << 12; /* 32..35 */
++		p_wr(0x0c, n3);
++		p_wr(0x10, n4);
++		delay(2000);
++		uint32_t pres = h_rd(H_PRESENT);
++		h_cmd(0, 0, R_NONE, NULL, true);
++		delay(2000);
++		int e = h_cmd(5, 0, R_R3, r, true);
++		printf("SWEET WIFI: alt %u: present 0x%08x (CMD %u DAT 0x%x) -> CMD5 %s\n", alt, pres,
++		    (pres >> 24) & 1, (pres >> 20) & 0xf, e ? "no" : "ANSWERED");
++		if (e == 0) {
++			return 0;
++		}
++	}
++	p_wr(0x0c, w3);
++	p_wr(0x10, w4);
++	return EIO;
++}
++
 +static int
 +sdio_init(void)
 +{
@@ -1288,8 +1333,8 @@ index 0000000..51ea98f
 +	h_cmd(0, 0, R_NONE, NULL, true);
 +	delay(2000);
 +	/* CMD5 with arg 0 asks for the OCR; then repeat with 3.2-3.4 V until ready. */
-+	if ((e = h_cmd(5, 0, R_R3, &r, false))) {
-+		printf("SWEET WIFI: no answer to CMD5 (pins not muxed? try boot-arg wifimux=N)\n");
++	if ((e = cmd5_probe(&r))) {
++		printf("SWEET WIFI: no answer to CMD5 with any pin function\n");
 +		return e;
 +	}
 +	printf("SWEET WIFI: CMD5 OCR 0x%08x (%u function(s))\n", r, (r >> 28) & 7);
@@ -1375,16 +1420,16 @@ index 0000000..51ea98f
 +		return;
 +	}
 +	/*
-+	 * The first read of the pinctrl block (0x107d504100) panicked the Pi
-+	 * (2026-11-10 STEP log): not accessible from here. Skip it unless
-+	 * boot-arg wifipins=1 and rely on the firmware's pin setup.
++	 * Pin muxing is needed: without it CMD/DAT read low (2026-11-10). The
++	 * first version panicked reading pinctrl past 0x20 (D0 block size);
++	 * reads now stay inside it. wifipins=0 skips pinctrl entirely.
 +	 */
-+	uint32_t pins = 0;
++	uint32_t pins = 1;
 +	PE_parse_boot_argn("wifipins", &pins, sizeof(pins));
 +	if (pins) {
 +		pins_setup();
 +	} else {
-+		printf("SWEET WIFI: pinctrl skipped (wifipins=1 to touch it)\n");
++		printf("SWEET WIFI: pinctrl skipped (wifipins=0)\n");
 +	}
 +	wl_power();
 +	if (sdio_init() == 0) {
@@ -3381,10 +3426,18 @@ index 0000000..723ca7c
 +	}
 +}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..910b2c0 100644
+index 0631685..c4a818d 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -18,14 +18,65 @@ public:
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,14 +19,71 @@ public:
  	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
  	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
  	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
@@ -3405,13 +3458,17 @@ index 0631685..910b2c0 100644
 +static uint64_t
 +sweet_adds_us(bool masked)
 +{
-+	uint64_t t0, t1, frq, daif, x = 0, n = 10000000;
-+	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(frq));
++	/*
++	 * Timed with mach_absolute_time (the kernel's timebase): raw CNTVCT_EL0
++	 * reads here gave 0 and then garbage (2026-11-10 log), so the earlier
++	 * ~57 MHz result is not trustworthy either.
++	 */
++	uint64_t t0, t1, daif, x = 0, n = 10000000, ns = 0;
 +	__asm__ volatile ("mrs %0, DAIF" : "=r"(daif));
 +	if (masked) {
 +		__asm__ volatile ("msr DAIFSet, #3" ::: "memory");
 +	}
-+	__asm__ volatile ("isb; mrs %0, CNTVCT_EL0" : "=r"(t0));
++	t0 = mach_absolute_time();
 +	__asm__ volatile (
 +		"1: add %0, %0, #1\n"
 +		"   add %0, %0, #1\n"
@@ -3420,12 +3477,14 @@ index 0631685..910b2c0 100644
 +		"   subs %1, %1, #4\n"
 +		"   b.ne 1b\n"
 +		: "+r"(x), "+r"(n) : : "cc");
-+	__asm__ volatile ("isb; mrs %0, CNTVCT_EL0" : "=r"(t1));
++	t1 = mach_absolute_time();
 +	__asm__ volatile ("msr DAIF, %0" : : "r"(daif) : "memory");
-+	/* Raw values too: the first build of this printed an impossible 0 us. */
-+	IOLog("SWEET: cpu probe %s: cntvct %llu -> %llu (%llu ticks), cntfrq %llu, x %llu n %llu\n",
-+	    masked ? "masked" : "open", t0, t1, t1 - t0, frq, x, n);
-+	return (t1 > t0 && frq) ? (t1 - t0) * 1000000ULL / frq : 0;
++	if (t1 > t0) {
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++	}
++	IOLog("SWEET: cpu probe %s: abs %llu -> %llu, %llu ns, x %llu n %llu\n",
++	    masked ? "masked" : "open", t0, t1, ns, x, n);
++	return ns / 1000;
 +}
 +
 +extern "C" void sweet_cpu_probe(const char *when);
@@ -3450,7 +3509,7 @@ index 0631685..910b2c0 100644
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}
-@@ -74,6 +125,39 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+@@ -74,6 +132,39 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
  	}
  }
  
