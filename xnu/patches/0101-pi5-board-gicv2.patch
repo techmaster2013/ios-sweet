@@ -3474,7 +3474,7 @@ index 0000000..723ca7c
 +	}
 +}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..439ca6b 100644
+index 0631685..20acc35 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -9,6 +9,7 @@
@@ -3485,7 +3485,7 @@ index 0631685..439ca6b 100644
  
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -18,14 +19,71 @@ public:
+@@ -18,19 +19,118 @@ public:
  	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
  	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
  	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
@@ -3495,6 +3495,45 @@ index 0631685..439ca6b 100644
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
  
 +#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++/*
++ * Metal step 1. Metal.framework finds IOServiceMatching("IOAcceleratorES"),
++ * reads MetalPluginName / MetalPluginClassName from it, loads
++ * /System/Library/Extensions/<name>.bundle and calls
++ * -[<class> initWithAcceleratorPort:]. This stand-in only advertises our
++ * plugin (SweetMetal.bundle, class SweetMTLDevice, a logging skeleton); no
++ * user client yet. Off unless boot-arg sweetmetal=1: a Metal device makes
++ * QuartzCore and UIKit take GPU paths the skeleton cannot serve yet.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static void
++sweet_metal_publish(IOService *provider)
++{
++	uint32_t on = 0;
++	PE_parse_boot_argn("sweetmetal", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	IOAcceleratorES *acc = OSTypeAlloc(IOAcceleratorES);
++	if (acc == NULL || !acc->init()) {
++		OSSafeReleaseNULL(acc);
++		return;
++	}
++	acc->setName("SweetAccelerator");
++	acc->setProperty("MetalPluginName", "SweetMetal");
++	acc->setProperty("MetalPluginClassName", "SweetMTLDevice");
++	acc->setProperty("model", "Raspberry Pi 5 VideoCore VII (SweetMetal)");
++	if (acc->attach(provider)) {
++		acc->registerService();
++		IOLog("SWEET METAL: IOAcceleratorES published (plugin SweetMetal / SweetMTLDevice)\n");
++	}
++	acc->release();
++}
++
 +/*
 + * CPU speed probe. Not via the PMU: touching PMCR_EL0 panicked the Pi at
 + * boot (trapped by the firmware). A chain of 10M dependent adds runs at
@@ -3557,7 +3596,15 @@ index 0631685..439ca6b 100644
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}
-@@ -74,6 +132,53 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++	sweet_metal_publish(this);
++#endif
+ 	return true;
+ }
+ 
+@@ -74,6 +174,53 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
  	}
  }
  
