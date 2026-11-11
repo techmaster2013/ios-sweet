@@ -210,6 +210,9 @@ static uint64_t adt_patch(uintptr_t adt, uint64_t phys_base, uint64_t mem_size,
 		pr("ADT serial-number %s\n", board->serial);
 	}
 
+	if (board && board->soc_rev && adt_set(adt, "/sweet-wifi", "soc-rev", 0, board->soc_rev, 4))
+		pr("ADT BCM2712 stepping %x\n", board->soc_rev);
+
 	/* dram-size = mem_size; the panic log (/pram) sits right above it. */
 	uintptr_t pram = adt_path(adt, "/pram");
 	uint64_t panic_size = 0;

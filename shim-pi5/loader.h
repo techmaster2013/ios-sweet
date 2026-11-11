@@ -9,6 +9,7 @@ struct loader_video {
 struct loader_board {
 	const char *serial;	/* /serial-number, or 0 */
 	uint64_t ram_top;	/* end of the RAM region holding the kernel, or 0 */
+	uint32_t soc_rev;	/* 0xc0 / 0xd0 from the firmware DT's pinctrl, or 0 */
 };
 
 /* A SWEETXNU payload in the initramfs the firmware (or QEMU -initrd) loaded? */

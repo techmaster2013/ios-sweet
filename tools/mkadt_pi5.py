@@ -189,6 +189,12 @@ def build(qemu=False, seed=None):
             ('power-button', u64(0x107d508500 + 4)),
             ('power-button-bit', u32(20)),
         ]))
+        # bsd/dev/sweet_wifi.c. soc-rev: BCM2712 stepping (0xc0 / 0xd0), filled
+        # in by the shim from the firmware DT's pinctrl compatible.
+        extra.append(node('sweet-wifi', [
+            ph(),
+            ('soc-rev', u32(0)),
+        ]))
 
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
     # iPad (6th generation) has a Home button: home-button-type 0.

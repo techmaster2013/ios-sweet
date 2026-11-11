@@ -959,10 +959,10 @@ index 6b926fe..7ed5036 100644
  
 diff --git a/bsd/dev/sweet_wifi.c b/bsd/dev/sweet_wifi.c
 new file mode 100644
-index 0000000..351fbcf
+index 0000000..10b03e7
 --- /dev/null
 +++ b/bsd/dev/sweet_wifi.c
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,505 @@
 +/*
 + * SWEET (Raspberry Pi 5) Wi-Fi, step 1: bring up the CYW43455 over SDIO and
 + * read its chip ID. No network yet.
@@ -992,6 +992,7 @@ index 0000000..351fbcf
 +#include <kern/clock.h>
 +#include <kern/sched_prim.h>
 +#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
 +#include <sys/proc.h>
 +
@@ -1420,16 +1421,28 @@ index 0000000..351fbcf
 +		return;
 +	}
 +	/*
-+	 * Pin muxing is needed: without it CMD/DAT read low (2026-11-10). The
-+	 * first version panicked reading pinctrl past 0x20 (D0 block size);
-+	 * reads now stay inside it. wifipins=0 skips pinctrl entirely.
++	 * BCM2712 stepping, from the shim (firmware DT pinctrl compatible). The
++	 * sd2 mux values differ: D0 alt 1 on pins 30..35, C0 4,4,4,3,4,3.
 +	 */
-+	uint32_t pins = 1;
++	DTEntry dt;
++	uint32_t const *rev = NULL;
++	unsigned int rsz = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-wifi", &dt) == kSuccess &&
++	    SecureDTGetProperty(dt, "soc-rev", (void const **)&rev, &rsz) == kSuccess && rsz >= 4) {
++		printf("SWEET WIFI: BCM2712 stepping %x (config.txt: %s)\n", *rev,
++		    *rev == 0xd0 ? "gpio=30-35=a1" : *rev == 0xc0 ? "gpio=30-32,34=a4 and gpio=33,35=a3" : "?");
++	}
++	/*
++	 * Pin muxing is needed (CMD/DAT read low without it, 2026-11-10), but
++	 * the pinctrl block faults on its first read from here (2026-11-11), so
++	 * the firmware has to do it (config.txt gpio=). wifipins=1 to try anyway.
++	 */
++	uint32_t pins = 0;
 +	PE_parse_boot_argn("wifipins", &pins, sizeof(pins));
 +	if (pins) {
 +		pins_setup();
 +	} else {
-+		printf("SWEET WIFI: pinctrl skipped (wifipins=0)\n");
++		printf("SWEET WIFI: pinctrl not touched (firmware pin setup; wifipins=1 to try)\n");
 +	}
 +	wl_power();
 +	if (sdio_init() == 0) {

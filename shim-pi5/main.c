@@ -240,8 +240,17 @@ static void board_info(uintptr_t fdt, struct loader_board *b)
 	struct fdt_node n;
 	b->serial = 0;
 	b->ram_top = 0;
+	b->soc_rev = 0;
 	if (fdt_find_path(fdt, "/", &n))
 		b->serial = dt_string(fdt, &n, "serial-number");
+	/*
+	 * BCM2712 stepping: the firmware picks bcm2712d0-rpi-5-b.dtb on D0 boards,
+	 * whose pinctrl differs (sd2 = alt 1 on pins 30..35; C0: 4,4,4,3,4,3).
+	 */
+	if (fdt_find_compatible(fdt, "brcm,bcm2712d0-pinctrl", 0, &n))
+		b->soc_rev = 0xd0;
+	else if (fdt_find_compatible(fdt, "brcm,bcm2712c0-pinctrl", 0, &n))
+		b->soc_rev = 0xc0;
 	/* The RAM region holding the kernel (it loads at 0x40000000). */
 	for (int i = 0; fdt_find_name(fdt, "memory", 1, i, &n); i++) {
 		uint64_t a, s;
@@ -249,7 +258,8 @@ static void board_info(uintptr_t fdt, struct loader_board *b)
 			if (a <= 0x40000000UL && a + s > 0x40000000UL && a + s > b->ram_top)
 				b->ram_top = a + s;
 	}
-	pr("board: serial %s, RAM above 0x40000000 ends at %lx\n", b->serial ? b->serial : "?", b->ram_top);
+	pr("board: serial %s, RAM above 0x40000000 ends at %lx, BCM2712 %x\n",
+	   b->serial ? b->serial : "?", b->ram_top, b->soc_rev);
 }
 
 static void report_memory(uintptr_t fdt)
