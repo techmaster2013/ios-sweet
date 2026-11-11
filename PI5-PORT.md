@@ -581,3 +581,21 @@ present 1920x1080 and hope SpringBoard copes. Start with 2048x1536 scaled down.
   868bc46 payload (wifi=1 sweetfb_hz=60 xhciscroll=24), config.txt
   `gpio=30-35=a1` + `gpio=31-35=pu` (board bought Aug 2026: D0 expected;
   config backup config-before-wifi.txt). Unknown: whether firmware aN = mux N.
+
+### 2026-11-11 midday: card for the next boot
+
+- The firmware boots `ios-pi5-shim.img` (config.txt kernel=), NOT kernel8.img:
+  the stepping shim had been copied to the wrong name. Now in place (old one:
+  ios-pi5-shim-before-stepping.img; kernel8.img restored).
+- config.txt: removed `gpio=30-35=a1 / 31-35=pu` (on Pi 5 config gpio= very
+  likely addresses RP1's bank, not the SoC's pins 30..35); added
+  `force_turbo=1` (CPU fell from 2400 to 1500 MHz after ~2 min; backups
+  config-before-wifi.txt / config-before-turbo.txt).
+- Kernel 1424cbd (CI 43048447229): console log flushed to the SD log
+  partition on panic (haltRestart kPEPanicSync). Payload wifi=1 (wifipins=0:
+  safe), sweetfb_hz=60, xhciscroll=24.
+- Root v14 (171 blocks): PiStrap with TrollStore Lite 2.1.1 + ldid +
+  libplist3 (TrollStore Lite Depends: ldid; bootstrap lacks ldid/libplist3).
+- wsl --mount --bare does not work with the SD reader (ERROR_INVALID_DRIVE).
+- Next Wi-Fi step: one boot with wifipins=1 to capture the pinctrl panic text
+  (now saved by the panic flush), plus the stepping from the new shim.
