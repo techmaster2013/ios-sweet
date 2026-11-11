@@ -14,10 +14,10 @@ index 6630131..8314347 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_sd.c b/bsd/dev/sweet_sd.c
 new file mode 100644
-index 0000000..8df7da2
+index 0000000..f8ed441
 --- /dev/null
 +++ b/bsd/dev/sweet_sd.c
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,928 @@
 +/*
 + * SWEET (Raspberry Pi 5) SD card root device.
 + *
@@ -800,11 +800,89 @@ index 0000000..8df7da2
 +	return sd_xfer(sd.log_first + rel, n, buf, true);
 +}
 +
++static uint64_t sdlog_flushed, sdlog_seq;
++static bool sdlog_running;
++
++/*
++ * Write console bytes [sdlog_flushed, now) to the ring, then the header.
++ * panicking: called from the panic path (haltRestart kPEPanicSync) with the
++ * other CPUs stopped: no lock (its holder may be a stopped CPU, possibly in
++ * mid-transfer, so reset the command/data lines first).
++ */
++static int
++sdlog_flush(bool panicking)
++{
++	uint64_t total = sweet_log_position();
++	if (total == sdlog_flushed) {
++		return 0;
++	}
++	/* Rewrite from the start of the sector holding the first new byte. */
++	uint64_t pos = sdlog_flushed & ~(uint64_t)(SD_BLOCK - 1);
++	if (total - pos > SDLOG_RING) {
++		pos = (total - SDLOG_RING + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
++	}
++	int error = 0;
++	if (panicking) {
++		sd_reset(RST_CMD | RST_DAT);
++	} else {
++		lck_mtx_lock(&sweet_sd_lock);
++	}
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SDLOG_RING);
++		uint32_t want = (uint32_t)MIN(MIN(total - pos, (uint64_t)SDLOG_CHUNK),
++		    (uint64_t)(SDLOG_RING - off));
++		uint64_t p = pos;
++		uint32_t got = sweet_log_copy(&p, (char *)sdlog_buf, want);
++		if (p - got != pos) {
++			/* Fell a whole ring behind: restart at a sector boundary. */
++			pos = (p - got + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
++			continue;
++		}
++		if (got == 0) {
++			break;
++		}
++		uint32_t blocks = (got + SD_BLOCK - 1) / SD_BLOCK;
++		bzero(sdlog_buf + got, blocks * SD_BLOCK - got);
++		error = sd_log_write(SDLOG_HDR + off / SD_BLOCK, blocks, sdlog_buf);
++		pos += got;
++	}
++	if (!error) {
++		struct {
++			char magic[8];
++			uint32_t version, size;
++			uint64_t total, seq;
++		} h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SDLOG_RING, .total = total, .seq = ++sdlog_seq,
++		};
++		bzero(sdlog_buf, SD_BLOCK);
++		memcpy(sdlog_buf, &h, sizeof(h));
++		error = sd_log_write(0, 1, sdlog_buf);
++	}
++	if (!panicking) {
++		lck_mtx_unlock(&sweet_sd_lock);
++	}
++	if (!error) {
++		sdlog_flushed = total;
++	}
++	return error;
++}
++
++/* Panic path: save everything up to and including the panic report. */
++void sweet_sd_log_panic_flush(void);
++
++void
++sweet_sd_log_panic_flush(void)
++{
++	if (sdlog_running && sd.ready) {
++		(void)sdlog_flush(true);
++	}
++}
++
 +static void
 +sweet_sd_log_thread(__unused void *arg, __unused wait_result_t wr)
 +{
-+	uint64_t flushed = 0, seq = 0;
-+
++	sdlog_running = true;
 +	printf("SWEET SD LOG: console log to partition at block %llu every %u s\n",
 +	    sd.log_first, sdlog_secs);
 +	uint32_t ticks = 0;
@@ -819,55 +897,12 @@ index 0000000..8df7da2
 +			sweet_cpu_probe("120 s after root");
 +		}
 +#endif
-+		uint64_t total = sweet_log_position();
-+		if (total == flushed) {
-+			continue;
-+		}
-+		/* Rewrite from the start of the sector holding the first new byte. */
-+		uint64_t pos = flushed & ~(uint64_t)(SD_BLOCK - 1);
-+		if (total - pos > SDLOG_RING) {
-+			pos = (total - SDLOG_RING + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
-+		}
-+		int error = 0;
-+		lck_mtx_lock(&sweet_sd_lock);
-+		while (pos < total && !error) {
-+			uint32_t off = (uint32_t)(pos % SDLOG_RING);
-+			uint32_t want = (uint32_t)MIN(MIN(total - pos, (uint64_t)SDLOG_CHUNK),
-+			    (uint64_t)(SDLOG_RING - off));
-+			uint64_t p = pos;
-+			uint32_t got = sweet_log_copy(&p, (char *)sdlog_buf, want);
-+			if (p - got != pos) {
-+				/* Fell a whole ring behind: restart at a sector boundary. */
-+				pos = (p - got + SD_BLOCK - 1) & ~(uint64_t)(SD_BLOCK - 1);
-+				continue;
-+			}
-+			if (got == 0) {
-+				break;
-+			}
-+			uint32_t blocks = (got + SD_BLOCK - 1) / SD_BLOCK;
-+			bzero(sdlog_buf + got, blocks * SD_BLOCK - got);
-+			error = sd_log_write(SDLOG_HDR + off / SD_BLOCK, blocks, sdlog_buf);
-+			pos += got;
-+		}
-+		if (!error) {
-+			struct {
-+				char magic[8];
-+				uint32_t version, size;
-+				uint64_t total, seq;
-+			} h = {
-+				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
-+				.version = 1, .size = SDLOG_RING, .total = total, .seq = ++seq,
-+			};
-+			bzero(sdlog_buf, SD_BLOCK);
-+			memcpy(sdlog_buf, &h, sizeof(h));
-+			error = sd_log_write(0, 1, sdlog_buf);
-+		}
-+		lck_mtx_unlock(&sweet_sd_lock);
++		int error = sdlog_flush(false);
 +		if (error) {
 +			printf("SWEET SD LOG: write failed (%d), stopping\n", error);
++			sdlog_running = false;
 +			return;
 +		}
-+		flushed = total;
 +	}
 +}
 +
@@ -3439,7 +3474,7 @@ index 0000000..723ca7c
 +	}
 +}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..c4a818d 100644
+index 0631685..439ca6b 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -9,6 +9,7 @@
@@ -3522,7 +3557,7 @@ index 0631685..c4a818d 100644
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}
-@@ -74,6 +132,39 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+@@ -74,6 +132,53 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
  	}
  }
  
@@ -3533,10 +3568,24 @@ index 0631685..c4a818d 100644
 + * board in its halt state, the power button starts it again). Panic restarts
 + * keep the default path so the panic stays on screen.
 + */
++extern "C" void sweet_sd_log_panic_flush(void);
++
 +int
 +SweetPlatformExpert::haltRestart(unsigned int type)
 +{
 +#if defined(SWEET_BOARD_PI5) && SWEET_BOARD_PI5
++	/*
++	 * Panic: the SD log thread never runs again, so write the console ring
++	 * (panic report included) to the log partition right here. Without this
++	 * every early panic left nothing on the card (Wi-Fi bring-up, 2026-11).
++	 */
++	if (type == kPEPanicSync || type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts) {
++		static bool flushed;
++		if (!flushed) {
++			flushed = true;
++			sweet_sd_log_panic_flush();
++		}
++	}
 +	uint64_t fn = 0;
 +	if (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU) {
 +		fn = 0x84000008;        /* PSCI SYSTEM_OFF */
